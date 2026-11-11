@@ -55,14 +55,59 @@ class PacketShark(BasePlugin):
         80: "HTTP",
         110: "POP3",
         123: "NTP",
+        137: "NetBIOS",
         143: "IMAP",
         443: "HTTPS (TLS)",
         993: "IMAPS",
         995: "POP3S",
         1900: "SSDP",
         5353: "mDNS",
+        5355: "LLMNR",
         8080: "HTTP-Alt",
         8443: "HTTPS-Alt",
+    }
+
+    OUI_DATABASE = {
+        # Intel (Laptops / Desktops)
+        "00:1b:21": "Intel", "00:1e:64": "Intel", "00:21:6a": "Intel", "00:23:14": "Intel",
+        "00:24:d7": "Intel", "08:11:96": "Intel", "34:13:e8": "Intel", "48:51:b7": "Intel",
+        "68:05:ca": "Intel", "7c:57:58": "Intel", "a0:af:bd": "Intel", "cc:2f:71": "Intel",
+        # Apple (MacBooks, iPhones, iPads, AppleTV)
+        "00:17:f2": "Apple", "00:1c:b3": "Apple", "00:1e:52": "Apple", "00:23:12": "Apple",
+        "00:25:00": "Apple", "00:26:08": "Apple", "3c:22:fb": "Apple", "38:f9:d3": "Apple",
+        "a4:83:e7": "Apple", "bc:d0:74": "Apple", "f0:18:98": "Apple", "f4:5c:89": "Apple",
+        # Dell
+        "00:14:22": "Dell", "00:18:8b": "Dell", "00:1a:a0": "Dell", "00:21:70": "Dell",
+        "18:03:73": "Dell", "24:b6:fd": "Dell", "34:e6:d7": "Dell", "74:86:7a": "Dell",
+        # HP
+        "00:16:35": "HP", "00:1f:29": "HP", "00:25:b3": "HP", "28:92:4a": "HP",
+        "30:8d:99": "HP", "80:ce:62": "HP", "9c:b6:54": "HP", "a4:5d:36": "HP",
+        # Lenovo
+        "00:59:07": "Lenovo", "20:76:93": "Lenovo", "50:7b:9d": "Lenovo", "80:2b:f9": "Lenovo",
+        "c8:5b:76": "Lenovo", "e8:6a:64": "Lenovo", "fc:01:7c": "Lenovo",
+        # Microsoft
+        "00:15:5d": "Microsoft", "28:18:78": "Microsoft", "60:45:bd": "Microsoft", "7c:1e:52": "Microsoft",
+        # ASUS & Acer & MSI
+        "00:1f:c6": "ASUS", "04:d9:f5": "ASUS", "08:60:6e": "ASUS", "10:7b:44": "ASUS",
+        "00:16:d3": "Acer", "00:1e:68": "Acer", "00:26:2d": "Acer", "00:1d:92": "Acer",
+        "00:16:17": "MSI", "00:19:db": "MSI", "00:24:21": "MSI", "d8:bb:c1": "MSI",
+        # Samsung
+        "00:12:47": "Samsung", "00:16:32": "Samsung", "00:1e:e1": "Samsung", "14:49:e0": "Samsung",
+        "2c:59:8a": "Samsung", "34:c7:31": "Samsung", "50:85:69": "Samsung", "84:25:19": "Samsung",
+        # Xiaomi
+        "00:ec:0a": "Xiaomi", "14:f6:5a": "Xiaomi", "28:6c:07": "Xiaomi", "34:80:62": "Xiaomi",
+        "64:09:80": "Xiaomi", "78:11:dc": "Xiaomi", "ac:c1:ee": "Xiaomi", "ec:d0:9f": "Xiaomi",
+        # Smart TVs & Media (Roku, LG, Sony, Amazon)
+        "00:0d:4b": "Roku", "20:df:b9": "Roku", "ac:ae:19": "Roku", "b0:a7:37": "Roku",
+        "00:1c:62": "LG TV", "00:1e:75": "LG TV", "10:f9:6f": "LG TV", "20:3d:66": "LG TV",
+        "00:13:a9": "Sony TV", "00:15:c1": "Sony TV", "00:19:c7": "Sony TV", "00:1a:80": "Sony TV",
+        "00:fc:8b": "Amazon", "38:f7:3d": "Amazon FireTV", "40:b4:cd": "Amazon Echo", "68:37:e9": "Amazon",
+        # Google
+        "00:1a:11": "Google", "3c:5a:37": "Google", "54:60:09": "Google", "94:eb:cd": "Chromecast",
+        # IoT & Network Chips
+        "b8:27:eb": "Raspberry Pi", "dc:a6:32": "Raspberry Pi", "e4:5f:01": "Raspberry Pi",
+        "18:fe:34": "Espressif", "24:0a:c4": "Espressif", "30:ae:a4": "Espressif",
+        "00:e0:4c": "Realtek", "52:54:00": "QEMU/VM",
     }
 
     def __init__(self, *args, **kwargs):
@@ -96,12 +141,16 @@ class PacketShark(BasePlugin):
         self._start_time = 0.0
         self._capture_rate = 0.0
 
-        # Stats & Hotspot Tracking
+        # Connected Hotspot Devices Registry & Nameplate Data
+        self._connected_devices = {}  # {ip: {"ip", "mac", "name", "vendor", "category", "icon", "pkts", "bytes", "domains", "last_seen", "state"}}
+        self._last_poll_clients = 0.0
+        self._hotspot_clients = set()
+        self._client_traffic = {}
+
+        # Stats
         self._top_talkers = Counter()
         self._proto_counts = Counter()
         self._hotspot_domains = Counter()
-        self._hotspot_clients = set()
-        self._client_traffic = {}  # {ip: {"pkts": 0, "bytes": 0, "domains": set()}}
 
         # Shell environment
         self._shell_mode = "none"  # shizuku, root, none
@@ -128,6 +177,7 @@ class PacketShark(BasePlugin):
         self._detect_shell()
         self._load_state()
         self._detect_active_hotspot()
+        self._poll_system_clients()
         self._ready = True
         self._log("info", "PacketShark ready · Shell: {} · Interface: {}".format(
             self._shell_mode.upper(), self._iface))
@@ -153,6 +203,303 @@ class PacketShark(BasePlugin):
                     self._iface = "wlan1"
         except Exception:
             pass
+
+    def _lookup_oui(self, mac):
+        if not mac or len(mac) < 8:
+            return "Unknown Vendor"
+        prefix = mac.lower()[:8]
+        return self.OUI_DATABASE.get(prefix, "Unknown Vendor")
+
+    def _categorize_device(self, name, vendor, mac, vendor_class="", ttl=None):
+        blob = (name + " " + vendor + " " + vendor_class).lower().replace("-", " ").replace("_", " ")
+
+        # 1. Smart TV / Streaming
+        if any(k in blob for k in ("tv", "roku", "bravia", "firetv", "chromecast", "appletv", "tizen", "webos")):
+            return "Smart TV / Streaming", "tv"
+
+        # 2. Tablet
+        if any(k in blob for k in ("ipad", "galaxy tab", "tab a", "tab s", "surface pro", "lenovo tab", "tablet")):
+            return "Tablet", "tablet_android"
+
+        # 3. Mobile Phone
+        if any(k in blob for k in ("iphone", "galaxy s", "galaxy a", "galaxy z", "pixel", "redmi", "xiaomi",
+                                   "oneplus", "oppo", "vivo", "realme", "motorola", "huawei phone")):
+            return "Mobile Phone", "phone_android"
+        if "android" in blob and not any(k in blob for k in ("tv", "pc", "laptop", "tablet", "tab")):
+            return "Mobile Phone", "phone_android"
+
+        # 4. Laptop / PC / Desktop
+        if any(k in blob for k in ("laptop", "desktop", "pc", "macbook", "thinkpad", "surface",
+                                   "dell", "hp", "lenovo", "intel", "asus", "acer", "msi",
+                                   "msft 5.0", "windows", "ubuntu", "fedora", "arch", "workstation")):
+            return "Laptop / PC", "laptop_mac"
+
+        # 5. Smart Home / IoT
+        if any(k in blob for k in ("raspberry", "espressif", "esp32", "esp8266", "printer", "camera")):
+            return "IoT / Smart Device", "memory"
+
+        # TTL heuristic: Windows defaults to TTL=128
+        if ttl and 64 < ttl <= 128:
+            return "Laptop / PC (Windows)", "laptop_mac"
+
+        return "Connected Device", "devices"
+
+    def _register_or_update_device(self, ip, mac="", name="", vendor_class="", ttl=None):
+        if not ip or ip.endswith(".255") or ip in ("0.0.0.0", "255.255.255.255"):
+            return
+        # Skip gateway if it's our own IP (.1) unless explicit name given
+        if ip.endswith(".1") and not name:
+            return
+
+        with self._lock:
+            dev = self._connected_devices.get(ip)
+            if not dev:
+                dev = {
+                    "ip": ip,
+                    "mac": mac or "Unknown",
+                    "name": name or "",
+                    "vendor": self._lookup_oui(mac) if mac else "Unknown Vendor",
+                    "category": "Client",
+                    "icon": "devices",
+                    "pkts": 0,
+                    "bytes": 0,
+                    "domains": set(),
+                    "last_seen": time.time(),
+                    "state": "Connected"
+                }
+                self._connected_devices[ip] = dev
+            else:
+                if mac and (dev["mac"] == "Unknown" or not dev["mac"]):
+                    dev["mac"] = mac
+                    dev["vendor"] = self._lookup_oui(mac)
+                if name and not dev["name"]:
+                    dev["name"] = name
+                dev["last_seen"] = time.time()
+
+            # If device name still empty, generate a readable identifier
+            if not dev["name"]:
+                if dev["vendor"] != "Unknown Vendor":
+                    dev["name"] = "{} Device".format(dev["vendor"].split()[0])
+                else:
+                    dev["name"] = "Device-" + ip.split(".")[-1]
+
+            # Categorize device
+            cat, icon = self._categorize_device(dev["name"], dev["vendor"], dev["mac"], vendor_class, ttl)
+            dev["category"] = cat
+            dev["icon"] = icon
+
+            self._hotspot_clients.add(ip)
+
+    def _poll_system_clients(self):
+        # 1. Check ARP / ip neigh table
+        try:
+            raw_neigh = ""
+            if self._shell_mode == "root" and hasattr(self, "root"):
+                raw_neigh = self.root("ip neigh")
+            elif self._shell_mode == "shizuku" and hasattr(self, "shizuku"):
+                raw_neigh = self.shizuku("ip neigh")
+            else:
+                try:
+                    res = subprocess.run(["ip", "neigh"], stdout=subprocess.PIPE, text=True, timeout=1.0)
+                    raw_neigh = res.stdout
+                except Exception:
+                    pass
+
+            if not raw_neigh:
+                try:
+                    if self._shell_mode == "root" and hasattr(self, "root"):
+                        raw_neigh = self.root("cat /proc/net/arp")
+                    elif self._shell_mode == "shizuku" and hasattr(self, "shizuku"):
+                        raw_neigh = self.shizuku("cat /proc/net/arp")
+                except Exception:
+                    pass
+
+            text_neigh = self._text(raw_neigh)
+            for line in text_neigh.splitlines():
+                parts = line.strip().split()
+                # ip neigh: 192.168.43.152 dev ap0 lladdr 38:f9:d3:4a:12:ef REACHABLE
+                if len(parts) >= 5 and parts[1] == "dev" and parts[3] == "lladdr":
+                    ip = parts[0]
+                    mac = parts[4].lower()
+                    if ":" in mac and len(mac) == 17:
+                        self._register_or_update_device(ip, mac=mac)
+                # /proc/net/arp: 192.168.43.152 0x1 0x2 38:f9:d3:4a:12:ef * ap0
+                elif len(parts) >= 4 and ":" in parts[3]:
+                    ip = parts[0]
+                    mac = parts[3].lower()
+                    if len(mac) == 17 and mac != "00:00:00:00:00:00":
+                        self._register_or_update_device(ip, mac=mac)
+        except Exception as exc:
+            self._log("warning", "poll neigh: " + str(exc)[:80])
+
+        # 2. Check dnsmasq.leases for real hostnames assigned by Android hotspot daemon
+        try:
+            leases_paths = [
+                "/data/misc/wifi/dnsmasq.leases",
+                "/data/vendor/wifi/dnsmasq.leases",
+                "/data/misc/dhcp/dnsmasq.leases",
+            ]
+            for lp in leases_paths:
+                raw_leases = ""
+                if self._shell_mode == "root" and hasattr(self, "root"):
+                    raw_leases = self.root("cat " + lp)
+                elif self._shell_mode == "shizuku" and hasattr(self, "shizuku"):
+                    raw_leases = self.shizuku("cat " + lp)
+                text_leases = self._text(raw_leases)
+                if text_leases and "No such file" not in text_leases:
+                    for line in text_leases.splitlines():
+                        parts = line.strip().split()
+                        # <time> <mac> <ip> <hostname> <client_id>
+                        if len(parts) >= 4:
+                            mac = parts[1].lower()
+                            ip = parts[2]
+                            hostname = parts[3]
+                            if hostname == "*":
+                                hostname = ""
+                            self._register_or_update_device(ip, mac=mac, name=hostname)
+        except Exception as exc:
+            self._log("warning", "poll leases: " + str(exc)[:80])
+
+    def _parse_dhcp(self, payload):
+        if len(payload) < 240:
+            return None
+        if payload[236:240] != b"\x63\x82\x53\x63":
+            return None
+        client_mac = self._mac_to_str(payload[28:34])
+        hostname = ""
+        vendor_class = ""
+        msg_type = ""
+        idx = 240
+        while idx < len(payload):
+            opt = payload[idx]
+            if opt == 255:
+                break
+            if opt == 0:
+                idx += 1
+                continue
+            if idx + 1 >= len(payload):
+                break
+            olen = payload[idx + 1]
+            oval = payload[idx + 2:idx + 2 + olen]
+            if opt == 12:
+                hostname = oval.decode("utf-8", errors="replace").strip()
+            elif opt == 60:
+                vendor_class = oval.decode("utf-8", errors="replace").strip()
+            elif opt == 53 and olen >= 1:
+                mtypes = {1: "Discover", 2: "Offer", 3: "Request", 4: "Decline", 5: "ACK", 6: "NAK", 7: "Release"}
+                msg_type = mtypes.get(oval[0], str(oval[0]))
+            idx += 2 + olen
+        return {"mac": client_mac, "hostname": hostname, "vendor_class": vendor_class, "msg_type": msg_type}
+
+    def _parse_nbns_name(self, payload):
+        if len(payload) < 46:
+            return None
+        try:
+            name_len = payload[12]
+            if name_len != 32:
+                return None
+            encoded = payload[13:45]
+            decoded = []
+            for i in range(0, 32, 2):
+                c = ((encoded[i] - ord("A")) << 4) | (encoded[i+1] - ord("A"))
+                if 32 <= c <= 126:
+                    decoded.append(chr(c))
+            name = "".join(decoded).strip()
+            return name if name else None
+        except Exception:
+            return None
+
+    def _parse_mdns_name(self, payload):
+        if len(payload) < 12:
+            return None
+        try:
+            idx = 12
+            parts = []
+            while idx < len(payload):
+                length = payload[idx]
+                if length == 0:
+                    break
+                if length >= 192:
+                    break
+                idx += 1
+                if idx + length > len(payload):
+                    break
+                part = payload[idx:idx + length].decode("utf-8", errors="replace")
+                parts.append(part)
+                idx += length
+            if parts:
+                full = ".".join(parts)
+                if "local" in full.lower():
+                    return full
+        except Exception:
+            pass
+        return None
+
+    def _render_nameplates(self, ui):
+        items = []
+        with self._lock:
+            devices = list(self._connected_devices.values())
+
+        if not devices:
+            items.append(ui.card([
+                ui.row([
+                    ui.text("🏷️  CONNECTED DEVICE NAMEPLATES", "labelSmall", color="secondary"),
+                    ui.text("0 Detected", "labelSmall", color="muted"),
+                ]),
+                ui.text("No client device connected to mobile hotspot yet.", "bodySmall"),
+                ui.text("Turn on Mobile Hotspot and connect your Laptop, Phone, or TV. Once connected, its nameplate will stack here automatically.", "labelSmall", color="muted"),
+                ui.row([
+                    self._button(ui, "🔄 Scan Connected Clients", self._poll_system_clients, style="tonal"),
+                ])
+            ]))
+            return items
+
+        # Stack Header
+        items.append(ui.row([
+            ui.text("🏷️  CONNECTED DEVICE NAMEPLATES ({})".format(len(devices)), "labelSmall", color="primary"),
+            self._button(ui, "🔄 Rescan", self._poll_system_clients, style="text"),
+        ]))
+
+        # Stacked Cards: Most recently active devices first
+        sorted_devices = sorted(devices, key=lambda d: d.get("last_seen", 0), reverse=True)
+        now = time.time()
+
+        for dev in sorted_devices:
+            ip = dev.get("ip", "")
+            mac = dev.get("mac", "")
+            name = dev.get("name", "Unknown Device")
+            category = dev.get("category", "Client")
+            vendor = dev.get("vendor", "Unknown Vendor")
+            pkts = dev.get("pkts", 0)
+            bcount = dev.get("bytes", 0)
+            last_seen = dev.get("last_seen", 0)
+            is_active = (now - last_seen < 15) if last_seen else False
+
+            status_text = "🟢 Active Now" if is_active else "⚪ Connected"
+            domains_list = list(dev.get("domains", []))[:3]
+            domains_str = " · ".join(domains_list) if domains_list else "Awaiting web requests"
+
+            cat_icon = "💻" if "Laptop" in category else "📱" if "Mobile" in category else "📺" if "TV" in category else "📟" if "Tablet" in category else "🌐"
+
+            card_children = [
+                ui.row([
+                    ui.text("{}  {}".format(cat_icon, name), "titleMedium", color="primary"),
+                    ui.text("[{}]".format(category), "labelSmall", color="secondary"),
+                ]),
+                ui.row([
+                    ui.text("IP: " + ip, "bodyMedium"),
+                    ui.text("ID/MAC: " + mac, "labelSmall", color="muted"),
+                ]),
+                ui.row([
+                    ui.text("Vendor: " + vendor, "labelSmall", color="muted"),
+                    ui.text("Traffic: {:,} pkts ({:.1f} KB)".format(pkts, bcount / 1024), "labelSmall", color="secondary"),
+                    ui.text(status_text, "labelSmall", color="primary" if is_active else "muted"),
+                ]),
+                ui.text("Live Activity: " + domains_str, "labelSmall", color="muted"),
+            ]
+            items.append(ui.card(card_children))
+
+        return items
 
     def _detect_shell(self):
         try:
@@ -447,6 +794,9 @@ class PacketShark(BasePlugin):
                 "target_mac": t_mac,
                 "target_ip": t_ip,
             }
+            # Register in device nameplate table
+            if s_ip and not s_ip.endswith(".1") and not s_ip.endswith(".255"):
+                self._register_or_update_device(s_ip, mac=s_mac)
             return pkt
 
         # IPv4
@@ -480,13 +830,15 @@ class PacketShark(BasePlugin):
             if is_hotspot_ip:
                 pkt["is_hotspot"] = True
                 client_ip = src_ip if (src_ip.startswith("10.") or src_ip.startswith("192.168.43.")) else dst_ip
-                # Skip gateway .1 or .153 broadcast
                 if not client_ip.endswith(".1") and not client_ip.endswith(".255"):
-                    self._hotspot_clients.add(client_ip)
-                    if client_ip not in self._client_traffic:
-                        self._client_traffic[client_ip] = {"pkts": 0, "bytes": 0, "domains": set()}
-                    self._client_traffic[client_ip]["pkts"] += 1
-                    self._client_traffic[client_ip]["bytes"] += len(raw)
+                    src_mac = pkt.get("eth", {}).get("src") if pkt.get("eth") else ""
+                    self._register_or_update_device(client_ip, mac=src_mac, ttl=ttl)
+                    with self._lock:
+                        if client_ip in self._connected_devices:
+                            self._connected_devices[client_ip]["pkts"] += 1
+                            self._connected_devices[client_ip]["bytes"] += len(raw)
+                            self._connected_devices[client_ip]["last_seen"] = ts
+                        self._hotspot_clients.add(client_ip)
 
             l4_offset = offset + ihl
             payload = raw[l4_offset:]
@@ -526,8 +878,9 @@ class PacketShark(BasePlugin):
                         self._hotspot_domains[sni] += 1
                         if pkt["is_hotspot"]:
                             client_ip = src_ip if src_ip.startswith("10.") else dst_ip
-                            if client_ip in self._client_traffic:
-                                self._client_traffic[client_ip]["domains"].add(sni)
+                            with self._lock:
+                                if client_ip in self._connected_devices:
+                                    self._connected_devices[client_ip]["domains"].add(sni)
                     else:
                         pkt["proto"] = "HTTPS (TLS)"
                 # Try HTTP
@@ -542,8 +895,9 @@ class PacketShark(BasePlugin):
                             self._hotspot_domains[host] += 1
                             if pkt["is_hotspot"]:
                                 client_ip = src_ip if src_ip.startswith("10.") else dst_ip
-                                if client_ip in self._client_traffic:
-                                    self._client_traffic[client_ip]["domains"].add(host)
+                                with self._lock:
+                                    if client_ip in self._connected_devices:
+                                        self._connected_devices[client_ip]["domains"].add(host)
 
             # UDP
             elif proto_num == 17 and len(payload) >= 8:
@@ -557,8 +911,43 @@ class PacketShark(BasePlugin):
                 }
                 pkt["info"] = "{} → {} Len={}".format(sport, dport, len(app_payload))
 
-                # DNS
-                if sport == 53 or dport == 53:
+                # DHCP (Ports 67, 68) - Device Name & Vendor Fingerprinting
+                if sport in (67, 68) or dport in (67, 68):
+                    dhcp = self._parse_dhcp(app_payload)
+                    if dhcp:
+                        pkt["proto"] = "DHCP"
+                        pkt["info"] = "DHCP {} (Host: {}, MAC: {})".format(
+                            dhcp.get("msg_type") or "Msg",
+                            dhcp.get("hostname") or "n/a",
+                            dhcp.get("mac") or "n/a"
+                        )
+                        pkt["app"] = dhcp
+                        client_ip = src_ip if src_ip != "0.0.0.0" else dst_ip
+                        self._register_or_update_device(
+                            client_ip, mac=dhcp.get("mac"), name=dhcp.get("hostname"),
+                            vendor_class=dhcp.get("vendor_class")
+                        )
+
+                # NetBIOS Name Service (Port 137) - Windows Computer Name
+                elif sport == 137 or dport == 137:
+                    nb_name = self._parse_nbns_name(app_payload)
+                    if nb_name:
+                        pkt["proto"] = "NBNS"
+                        pkt["info"] = "NetBIOS Name: " + nb_name
+                        pkt["app"] = {"type": "NBNS", "name": nb_name}
+                        self._register_or_update_device(src_ip, name=nb_name, vendor_class="Windows NetBIOS")
+
+                # mDNS (Port 5353) - Apple / Linux .local hostnames
+                elif sport == 5353 or dport == 5353:
+                    mdns_name = self._parse_mdns_name(app_payload)
+                    if mdns_name:
+                        pkt["proto"] = "mDNS"
+                        pkt["info"] = "mDNS Host: " + mdns_name
+                        pkt["app"] = {"type": "mDNS", "name": mdns_name}
+                        self._register_or_update_device(src_ip, name=mdns_name)
+
+                # Standard DNS (Port 53)
+                elif sport == 53 or dport == 53:
                     dns_info = self._parse_dns(app_payload)
                     if dns_info:
                         pkt["proto"] = "DNS"
@@ -569,9 +958,10 @@ class PacketShark(BasePlugin):
                         if qname:
                             self._hotspot_domains[qname] += 1
                             if pkt["is_hotspot"]:
-                                client_ip = src_ip if src_ip.startswith("10.") else dst_ip
-                                if client_ip in self._client_traffic:
-                                    self._client_traffic[client_ip]["domains"].add(qname)
+                                client_ip = src_ip if (src_ip.startswith("10.") or src_ip.startswith("192.168.43.")) else dst_ip
+                                with self._lock:
+                                    if client_ip in self._connected_devices:
+                                        self._connected_devices[client_ip]["domains"].add(qname)
 
             # ICMP
             elif proto_num == 1 and len(payload) >= 4:
@@ -1031,9 +1421,16 @@ class PacketShark(BasePlugin):
 
         if not visible_pkts:
             children.append(ui.card([
-                ui.text("📭  Terminal buffer empty", "titleMedium"),
-                ui.text("Connect laptop to hotspot and tap Start Live Stream, or load samples.", "bodySmall", color="secondary"),
-                self._button(ui, "⚡ Generate Sample Traffic", self._generate_synthetic_sample, style="tonal"),
+                ui.row([
+                    ui.text("📡  WAITING FOR LIVE TRAFFIC", "titleSmall", color="primary"),
+                    ui.text("100% Genuine Wire", "labelSmall", color="secondary"),
+                ]),
+                ui.text("Terminal buffer is empty. No packets captured yet on [{}].".format(self._iface), "bodyMedium"),
+                ui.text("To test: Connect your laptop to your phone's hotspot. Once connected, open a website or run 'ping 1.1.1.1' on your laptop — real packets will stream here immediately.", "bodySmall", color="muted"),
+                ui.row([
+                    self._button(ui, "🔄 Scan Connected Clients", self._poll_system_clients, style="tonal"),
+                    self._button(ui, "▶ Start Capture", self._start_capture, enabled=not self._capturing, style="filled"),
+                ])
             ]))
         else:
             # Format terminal lines like Linux tshark / tcpdump
@@ -1421,28 +1818,34 @@ class PacketShark(BasePlugin):
 
         try:
             if self._page == "live":
-                body = self._live_console_ui(ui)
+                page_body = self._live_console_ui(ui)
             elif self._page == "packets":
-                body = self._packets_table_ui(ui)
+                page_body = self._packets_table_ui(ui)
             elif self._page == "detail":
-                body = self._detail_ui(ui)
+                page_body = self._detail_ui(ui)
             elif self._page == "stats":
-                body = self._stats_ui(ui)
+                page_body = self._stats_ui(ui)
             elif self._page == "pcap":
-                body = self._pcap_ui(ui)
+                page_body = self._pcap_ui(ui)
             elif self._page == "settings":
-                body = self._settings_ui(ui)
+                page_body = self._settings_ui(ui)
             else:
-                body = self._live_console_ui(ui)
+                page_body = self._live_console_ui(ui)
         except Exception as exc:
             self._log("error", "render page: " + str(exc))
-            body = [
+            page_body = [
                 ui.card([
                     ui.text("Render Error", "titleMedium", color="error"),
                     ui.text(str(exc)[:200], "bodySmall"),
                     self._button(ui, "Back to Live Feed", lambda: self._go("live"), style="tonal")
                 ])
             ]
+
+        body = []
+        # Top-Stacked Connected Device Nameplates
+        body.extend(self._render_nameplates(ui))
+        # Current Tab Body Content
+        body.extend(page_body)
 
         content = ui.lazy_column(body, padding=16, spacing=10, fill_max_size=True)
 
