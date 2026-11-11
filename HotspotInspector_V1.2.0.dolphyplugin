@@ -1,0 +1,962 @@
+# -*- coding: utf-8 -*-
+"""
+Dolphy App Plugin: Hotspot Network Inspector & Silent Client Identifier
+Compatible with Dolphy 2.5+ (Chaquopy Python 3.11 Runtime)
+Version 1.2.0 - Features Primary Shizuku Kernel Polling & Secondary Passive/Active Auto-Probing
+"""
+
+__id__ = "hotspot_inspector"
+__name__ = "Hotspot Inspector"
+__title__ = "Hotspot Inspector"
+__icon__ = "rounded:router"
+__version__ = "1.2.0"
+__author__ = "Lab"
+__description__ = "Silent hotspot client discovery, device nameplates, and real-time terminal telemetry."
+__permissions__ = ["files", "shizuku"]
+
+import os
+import re
+import sys
+import time
+import json
+import socket
+import select
+import hashlib
+import threading
+import http.server
+import socketserver
+from datetime import datetime
+
+# Dolphy BasePlugin injection fallback
+if "BasePlugin" not in globals() and "BasePlugin" not in dir(__builtins__):
+    try:
+        from dolphy import BasePlugin
+    except Exception:
+        try:
+            from dolphy.plugin import BasePlugin
+        except Exception:
+            class BasePlugin:
+                def __init__(self, *args, **kwargs):
+                    self.modules = []
+                def add_module(self, *args, **kwargs):
+                    pass
+                def toast(self, msg): pass
+                def log(self, level, msg): pass
+                def refresh(self): pass
+                def root(self, cmd): return ""
+                def shizuku(self, cmd): return ""
+
+
+# =============================================================================
+# Fallback HTTP Gateway Handler (Captive / Handshake Endpoint)
+# =============================================================================
+
+class _GatewayHTTPHandler(http.server.BaseHTTPRequestHandler):
+    """Fallback captive portal / direct browser handshake listener."""
+
+    def log_message(self, format, *args):
+        pass
+
+    def do_GET(self):
+        client_ip = self.client_address[0]
+        user_agent = self.headers.get("User-Agent", "Unknown Device")
+        host_header = self.headers.get("Host", "")
+
+        if hasattr(self.server, "plugin_instance"):
+            self.server.plugin_instance.register_http_handshake(client_ip, user_agent, host_header)
+
+        body = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Hotspot Inspector - Registered</title>
+    <style>
+        body {{
+            background: #0f141c; color: #e2e8f0;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            margin: 0; padding: 30px 16px; display: flex; justify-content: center;
+        }}
+        .box {{
+            background: #1a2230; border: 1px solid #2d3748; border-radius: 16px;
+            padding: 24px; max-width: 440px; width: 100%; box-shadow: 0 10px 25px rgba(0,0,0,0.5);
+            text-align: center;
+        }}
+        .badge {{
+            display: inline-block; background: #10b981; color: #ffffff;
+            padding: 6px 14px; border-radius: 9999px; font-size: 13px; font-weight: 700;
+            margin-bottom: 16px;
+        }}
+        h2 {{ margin: 0 0 10px; font-size: 22px; color: #ffffff; }}
+        p {{ margin: 6px 0; color: #94a3b8; font-size: 14px; }}
+        .data-grid {{
+            margin-top: 20px; text-align: left; background: #111827;
+            padding: 14px; border-radius: 10px; border: 1px solid #1f2937;
+        }}
+        .data-row {{ display: flex; justify-content: space-between; margin: 6px 0; font-size: 13px; }}
+        .label {{ color: #64748b; font-weight: 600; }}
+        .value {{ color: #38bdf8; font-family: monospace; font-weight: bold; }}
+    </style>
+</head>
+<body>
+    <div class="box">
+        <span class="badge">&#10003; DEVICE REGISTERED</span>
+        <h2>Hotspot Inspector</h2>
+        <p>Your device identity is now actively displayed on the Hotspot Inspector dashboard.</p>
+        <div class="data-grid">
+            <div class="data-row"><span class="label">Client IP:</span><span class="value">{client_ip}</span></div>
+            <div class="data-row"><span class="label">Gateway:</span><span class="value">{self.server.gateway_ip}:8080</span></div>
+            <div class="data-row"><span class="label">Timestamp:</span><span class="value">{datetime.now().strftime("%H:%M:%S")}</span></div>
+        </div>
+    </div>
+</body>
+</html>"""
+        encoded = body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(encoded)
+
+
+class _ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+# =============================================================================
+# Main Hotspot Inspector Plugin
+# =============================================================================
+
+class HotspotInspector(BasePlugin):
+    # OUI Prefix Table for Hardware Fingerprinting
+    KNOWN_OUIS = {
+        # Intel Wi-Fi Chips (Common in laptops)
+        "0002B3": ("Intel", "Laptop / Desktop"), "000347": ("Intel", "Laptop / Desktop"),
+        "001302": ("Intel", "Laptop / Desktop"), "001500": ("Intel", "Laptop / Desktop"),
+        "001676": ("Intel", "Laptop / Desktop"), "001E67": ("Intel", "Laptop / Desktop"),
+        "00216A": ("Intel", "Laptop / Desktop"), "0024D7": ("Intel", "Laptop / Desktop"),
+        "081196": ("Intel", "Laptop / Desktop"), "1002B5": ("Intel", "Laptop / Desktop"),
+        "3413E8": ("Intel", "Laptop / Desktop"), "3CF862": ("Intel", "Laptop / Desktop"),
+        "4851B7": ("Intel", "Laptop / Desktop"), "6805CA": ("Intel", "Laptop / Desktop"),
+        "8086F2": ("Intel", "Laptop / Desktop"), "94E6F7": ("Intel", "Laptop / Desktop"),
+        "A036BC": ("Intel", "Laptop / Desktop"), "AC7289": ("Intel", "Laptop / Desktop"),
+        "C89402": ("Intel", "Laptop / Desktop"), "EC6264": ("Intel", "Laptop / Desktop"),
+        # Realtek (Laptops & Desktops)
+        "00070E": ("Realtek", "Laptop / Desktop"), "00E04C": ("Realtek", "Laptop / Desktop"),
+        "04CF8C": ("Realtek", "Laptop / Desktop"), "207693": ("Realtek", "Laptop / Desktop"),
+        "44334C": ("Realtek", "Laptop / Desktop"), "54A050": ("Realtek", "Laptop / Desktop"),
+        "74EE2A": ("Realtek", "Laptop / Desktop"), "882593": ("Realtek", "Laptop / Desktop"),
+        "A057E5": ("Realtek", "Laptop / Desktop"), "B8EE65": ("Realtek", "Laptop / Desktop"),
+        # MediaTek (Laptops & Wi-Fi 6)
+        "000CE7": ("MediaTek", "Laptop / Desktop"), "080028": ("MediaTek", "Laptop / Desktop"),
+        "3CCD36": ("MediaTek", "Laptop / Desktop"), "84C9B2": ("MediaTek", "Laptop / Desktop"),
+        "AC2B6E": ("MediaTek", "Laptop / Desktop"), "B025AA": ("MediaTek", "Laptop / Desktop"),
+        # Qualcomm Atheros (Laptops & Mobiles)
+        "00037F": ("Qualcomm", "Laptop / Desktop"), "001374": ("Qualcomm", "Laptop / Desktop"),
+        "204E71": ("Qualcomm", "Laptop / Desktop"), "8425DB": ("Qualcomm", "Laptop / Desktop"),
+        # Apple (Mac, iPhone, iPad)
+        "000393": ("Apple", "Laptop / MacBook"), "000502": ("Apple", "Laptop / MacBook"),
+        "0010FA": ("Apple", "Laptop / MacBook"), "001C42": ("Apple", "Laptop / MacBook"),
+        "002332": ("Apple", "Laptop / MacBook"), "0025BC": ("Apple", "Laptop / MacBook"),
+        "3C0630": ("Apple", "Laptop / MacBook"), "FCF8AE": ("Apple", "Laptop / MacBook"),
+        "ACDE48": ("Apple", "Laptop / MacBook"), "BC926B": ("Apple", "Laptop / MacBook"),
+        "F4F5E8": ("Apple", "Apple Mobile / Mac"), "B87826": ("Apple", "Apple Mobile / Mac"),
+        # Dell, HP, Lenovo
+        "001422": ("Dell", "Laptop / Desktop"), "14FEB5": ("Dell", "Laptop / Desktop"),
+        "34E6D7": ("Dell", "Laptop / Desktop"), "74867A": ("Dell", "Laptop / Desktop"),
+        "000802": ("HP", "Laptop / Desktop"), "10604B": ("HP", "Laptop / Desktop"),
+        "705A0F": ("HP", "Laptop / Desktop"), "C8CBB8": ("HP", "Laptop / Desktop"),
+        "005907": ("Lenovo", "Laptop / Desktop"), "3052CB": ("Lenovo", "Laptop / Desktop"),
+        "40A8F0": ("Lenovo", "Laptop / Desktop"), "A48CDB": ("Lenovo", "Laptop / Desktop"),
+        # Samsung, Xiaomi, Huawei, Google
+        "000278": ("Samsung", "Mobile Phone"), "00166C": ("Samsung", "Mobile Phone"),
+        "244BFE": ("Samsung", "Mobile Phone"), "90187C": ("Samsung", "Mobile Phone"),
+        "009EC8": ("Xiaomi", "Mobile Phone"), "286C07": ("Xiaomi", "Mobile Phone"),
+        "50642B": ("Xiaomi", "Mobile Phone"), "640980": ("Xiaomi", "Mobile Phone"),
+        "001E10": ("Huawei", "Mobile Phone"), "707B8C": ("Huawei", "Mobile Phone"),
+        "D857EF": ("Google", "Mobile Phone"), "F4F5D8": ("Google", "Mobile Phone"),
+        # Smart TVs & Streaming
+        "0005C9": ("LG Electronics", "Smart TV"), "40B0FA": ("LG Electronics", "Smart TV"),
+        "00014A": ("Sony", "Smart TV"), "FC0FE6": ("Sony", "Smart TV / PlayStation"),
+        "000D4B": ("Roku", "Smart TV"), "2CAA8E": ("Roku", "Smart TV"),
+    }
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.running = False
+        self.api_ref = None
+
+        self.gateway_ip = self._detect_gateway_ip()
+        self.gateway_port = 8080
+
+        # Connected clients dict: key = IP
+        # Value = { 'ip', 'name', 'id_code', 'category', 'os', 'agent', 'mac', 'vendor', 'vector', 'first_seen', 'last_seen', 'hits' }
+        self.connected_devices = {}
+        self.terminal_logs = []
+        self._log_lock = threading.Lock()
+
+        # Thread handles
+        self.shizuku_thread = None
+        self.multicast_thread = None
+        self.prober_thread = None
+        self.httpd = None
+        self.http_thread = None
+
+        self.shizuku_status = "INITIALIZING"
+        self.stats = {
+            "total_clients": 0,
+            "shizuku_hits": 0,
+            "passive_hits": 0,
+            "probe_hits": 0,
+            "http_hits": 0,
+            "start_time": None
+        }
+
+        self._log("SYS", f"Hotspot Inspector V1.2.0 initialized. Hotspot Gateway: {self.gateway_ip}")
+
+    # =========================================================================
+    # In-App Terminal Logging Subsystem
+    # =========================================================================
+
+    def _log(self, tag, message):
+        ts = datetime.now().strftime("%H:%M:%S")
+        entry = f"[{ts}] [{tag}] {message}"
+        with self._log_lock:
+            self.terminal_logs.append(entry)
+            if len(self.terminal_logs) > 180:
+                self.terminal_logs.pop(0)
+
+        if hasattr(self, "log"):
+            try:
+                self.log("info", entry)
+            except Exception:
+                pass
+
+    def clear_terminal(self):
+        with self._log_lock:
+            self.terminal_logs = [f"[{datetime.now().strftime('%H:%M:%S')}] [SYS] Terminal log cleared."]
+        self._refresh_ui()
+
+    # =========================================================================
+    # Device Registration & Categorization Engine
+    # =========================================================================
+
+    def _detect_gateway_ip(self):
+        """Identifies hotspot interface ap0 or default gateway IP."""
+        try:
+            import ctypes
+            import ctypes.util
+
+            libc_name = ctypes.util.find_library("c") or "libc.so"
+            libc = ctypes.CDLL(libc_name)
+
+            class SockAddr(ctypes.Structure):
+                _fields_ = [("sa_family", ctypes.c_ushort), ("sa_data", ctypes.c_char * 14)]
+
+            class SockAddrIn(ctypes.Structure):
+                _fields_ = [
+                    ("sin_family", ctypes.c_ushort),
+                    ("sin_port", ctypes.c_ushort),
+                    ("sin_addr", ctypes.c_uint32),
+                    ("sin_zero", ctypes.c_char * 8),
+                ]
+
+            class IfAddrs(ctypes.Structure):
+                pass
+
+            IfAddrs._fields_ = [
+                ("ifa_next", ctypes.POINTER(IfAddrs)),
+                ("ifa_name", ctypes.c_char_p),
+                ("ifa_flags", ctypes.c_uint),
+                ("ifa_addr", ctypes.POINTER(SockAddr)),
+                ("ifa_netmask", ctypes.POINTER(SockAddr)),
+                ("ifa_ifu", ctypes.c_void_p),
+                ("ifa_data", ctypes.c_void_p),
+            ]
+
+            getifaddrs = libc.getifaddrs
+            getifaddrs.argtypes = [ctypes.POINTER(ctypes.POINTER(IfAddrs))]
+            getifaddrs.restype = ctypes.c_int
+            freeifaddrs = libc.freeifaddrs
+            freeifaddrs.argtypes = [ctypes.POINTER(IfAddrs)]
+
+            ifap = ctypes.POINTER(IfAddrs)()
+            if getifaddrs(ctypes.byref(ifap)) == 0 and ifap:
+                curr = ifap
+                detected_ap = None
+                while curr:
+                    item = curr.contents
+                    if item.ifa_name and item.ifa_addr:
+                        name = item.ifa_name.decode("utf-8", errors="ignore")
+                        family = item.ifa_addr.contents.sa_family
+                        if family == socket.AF_INET:
+                            sin = ctypes.cast(item.ifa_addr, ctypes.POINTER(SockAddrIn)).contents
+                            ip_bytes = sin.sin_addr.to_bytes(4, byteorder=sys.byteorder)
+                            ip_str = socket.inet_ntoa(ip_bytes)
+                            if name.startswith("ap") or name.startswith("swlan") or name.startswith("softap"):
+                                detected_ap = ip_str
+                                break
+                    curr = item.ifa_next
+                freeifaddrs(ifap)
+                if detected_ap:
+                    return detected_ap
+        except Exception:
+            pass
+
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 53))
+            ip = s.getsockname()[0]
+            s.close()
+            if ip and not ip.startswith("127."):
+                return ip
+        except Exception:
+            pass
+
+        return "10.187.128.153"
+
+    def _resolve_oui(self, mac):
+        """Resolves MAC prefix into Manufacturer Name and Device Category."""
+        clean = mac.replace(":", "").replace("-", "").upper()
+        prefix = clean[:6]
+        if prefix in self.KNOWN_OUIS:
+            vendor, cat = self.KNOWN_OUIS[prefix]
+            return vendor, cat
+
+        # Check for locally administered / randomized MAC (2nd bit of 1st byte == 1)
+        try:
+            first_byte = int(clean[:2], 16)
+            if first_byte & 0x02:
+                return "Private MAC Device", "Laptop / Mobile"
+        except Exception:
+            pass
+
+        return "Network Client", "Connected Device"
+
+    def register_device(self, ip, name=None, category=None, os_ver=None, mac=None, vector="AUTO"):
+        """Thread-safe registration and real-time Nameplate generation."""
+        if not ip or ip == self.gateway_ip or ip.startswith("127.") or ip.endswith(".255"):
+            return
+
+        ts = datetime.now().strftime("%H:%M:%S")
+
+        # Generate deterministic device ID code
+        seed = f"{ip}:{mac or ''}:{name or ''}"
+        code_hash = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:6].upper()
+        id_code = f"DEV-{code_hash}"
+
+        # Resolve vendor & category if MAC provided
+        vendor_name = "Generic Host"
+        if mac:
+            vendor_name, resolved_cat = self._resolve_oui(mac)
+            if not category or category == "Connected Device":
+                category = resolved_cat
+
+        if not category:
+            category = "Laptop / PC"
+        if not name:
+            name = f"{vendor_name} ({category})"
+        if not os_ver:
+            os_ver = "Active Host (Online)"
+
+        is_new = ip not in self.connected_devices
+        if is_new:
+            self.connected_devices[ip] = {
+                "ip": ip,
+                "name": name,
+                "id_code": id_code,
+                "category": category,
+                "os": os_ver,
+                "mac": mac or "Hidden (Firewall)",
+                "vendor": vendor_name,
+                "vector": vector,
+                "first_seen": ts,
+                "last_seen": ts,
+                "hits": 1
+            }
+            self._log("DET", f"SILENT DETECTION ({vector}): {ip} -> {name} [{category}]")
+            self._log("REG", f"Nameplate Pinned: Code={id_code} | MAC={mac or 'Unresolved'} | Vector={vector}")
+        else:
+            dev = self.connected_devices[ip]
+            dev["last_seen"] = ts
+            dev["hits"] += 1
+            if name and "Generic" not in name:
+                dev["name"] = name
+            if mac and dev["mac"] == "Hidden (Firewall)":
+                dev["mac"] = mac
+                dev["vendor"] = vendor_name
+            if category and dev["category"] in ("Connected Device", "Network Client"):
+                dev["category"] = category
+            if os_ver and "Active Host" not in os_ver:
+                dev["os"] = os_ver
+            self._log("ACT", f"Client heartbeat: {ip} ({dev['id_code']}) via {vector} [Hit #{dev['hits']}]")
+
+        self.stats["total_clients"] = len(self.connected_devices)
+        self._refresh_ui()
+
+    def register_http_handshake(self, ip, user_agent, host_header):
+        """Processes fallback browser or captive portal handshakes."""
+        ua = user_agent.lower()
+        if "windows" in ua:
+            name, cat, os_ver = "Windows Workstation", "Laptop / Desktop", "Windows 11 / 10"
+        elif "macintosh" in ua or "mac os x" in ua:
+            name, cat, os_ver = "Apple Mac", "Laptop / MacBook", "macOS"
+        elif "ipad" in ua:
+            name, cat, os_ver = "Apple iPad", "Tablet", "iPadOS"
+        elif "iphone" in ua:
+            name, cat, os_ver = "Apple iPhone", "Mobile Phone", "iOS"
+        elif "android" in ua:
+            name, cat, os_ver = "Android Phone", "Mobile Phone", "Android"
+        elif "linux" in ua:
+            name, cat, os_ver = "Linux Machine", "Laptop / Desktop", "Linux OS"
+        elif any(tv in ua for tv in ["smart-tv", "tizen", "webos", "roku", "appletv"]):
+            name, cat, os_ver = "Smart TV", "Smart TV / Streaming", "Smart TV OS"
+        else:
+            name, cat, os_ver = "Connected Host", "Network Device", "Standard Client"
+
+        self.stats["http_hits"] += 1
+        self.register_device(ip, name=name, category=cat, os_ver=os_ver, vector="HTTP-HANDSHAKE")
+
+    # =========================================================================
+    # PRIMARY TASK: Silent Shizuku & Kernel ARP Watcher
+    # =========================================================================
+
+    def _exec_privileged_shell(self, cmd):
+        """Executes shell command via Shizuku or Root if available."""
+        # 1. Dolphy direct shizuku method
+        if hasattr(self, "shizuku"):
+            try:
+                res = self.shizuku(cmd)
+                if res and isinstance(res, str) and len(res.strip()) > 0:
+                    return res.strip()
+            except Exception:
+                pass
+
+        # 2. Dolphy direct root method
+        if hasattr(self, "root"):
+            try:
+                res = self.root(cmd)
+                if res and isinstance(res, str) and len(res.strip()) > 0:
+                    return res.strip()
+            except Exception:
+                pass
+
+        # 3. Dolphy API object shizuku/shell
+        if self.api_ref:
+            if hasattr(self.api_ref, "shizuku") and hasattr(self.api_ref.shizuku, "exec"):
+                try:
+                    res = self.api_ref.shizuku.exec(cmd)
+                    if res:
+                        return str(res).strip()
+                except Exception:
+                    pass
+
+        return ""
+
+    def _run_shizuku_poller(self):
+        """Continuous background thread polling kernel neighbor tables via Shizuku."""
+        self._log("SHIZUKU", "Starting primary kernel ARP poller thread...")
+        while self.running:
+            try:
+                # 1. Query ip neigh show
+                out = self._exec_privileged_shell("ip neigh show dev ap0")
+                if not out:
+                    out = self._exec_privileged_shell("ip neigh show")
+
+                if out:
+                    self.shizuku_status = "ACTIVE (PRIVILEGED)"
+                    for line in out.splitlines():
+                        parts = line.strip().split()
+                        if len(parts) >= 4:
+                            ip = parts[0]
+                            mac = None
+                            if "lladdr" in parts:
+                                idx = parts.index("lladdr")
+                                if idx + 1 < len(parts):
+                                    mac = parts[idx + 1].upper()
+                            elif re.match(r"^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$", parts[-2]):
+                                mac = parts[-2].upper()
+
+                            state = parts[-1].upper()
+                            if mac and mac != "00:00:00:00:00:00" and state in ("REACHABLE", "STALE", "DELAY", "PROBE"):
+                                vendor, cat = self._resolve_oui(mac)
+                                name = f"{vendor} Workstation" if "Laptop" in cat else f"{vendor} Device"
+                                self.stats["shizuku_hits"] += 1
+                                self.register_device(ip, name=name, category=cat, mac=mac, os_ver=f"Kernel State: {state}", vector="SHIZUKU-ARP")
+                else:
+                    # 2. Try direct reading /proc/net/arp fallback
+                    arp_path = "/proc/net/arp"
+                    if os.path.exists(arp_path):
+                        try:
+                            with open(arp_path, "r", encoding="utf-8") as f:
+                                for line in f.readlines()[1:]:
+                                    parts = line.strip().split()
+                                    if len(parts) >= 6 and parts[2] != "0x0" and parts[3] != "00:00:00:00:00:00":
+                                        ip, mac = parts[0], parts[3].upper()
+                                        vendor, cat = self._resolve_oui(mac)
+                                        name = f"{vendor} Workstation" if "Laptop" in cat else f"{vendor} Device"
+                                        self.register_device(ip, name=name, category=cat, mac=mac, vector="PROC-ARP")
+                        except Exception:
+                            pass
+
+                    if self.shizuku_status != "ACTIVE (PRIVILEGED)":
+                        self.shizuku_status = "IDLE (START SHIZUKU APP FOR INSTANT ARP)"
+
+            except Exception as e:
+                self._log("ERR", f"Shizuku poll error: {str(e)}")
+
+            time.sleep(2)
+
+    # =========================================================================
+    # SECONDARY TASK: Passive Multicast & Active Subnet Prober
+    # =========================================================================
+
+    def _run_passive_multicast_listener(self):
+        """Passively listens on mDNS (5353), LLMNR (5355), SSDP (1900), and WS-Discovery (3702)."""
+        self._log("PASSIVE", "Starting passive background multicast listeners on ports 5353, 5355, 1900, 3702...")
+        ports = [5353, 5355, 1900, 3702]
+        mcast_groups = {
+            5353: "224.0.0.251",
+            5355: "224.0.0.252",
+            1900: "239.255.255.250",
+            3702: "239.255.255.250"
+        }
+
+        sockets = []
+        for p in ports:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind(("0.0.0.0", p))
+                grp = mcast_groups.get(p)
+                if grp:
+                    try:
+                        mreq = socket.inet_aton(grp) + socket.inet_aton(self.gateway_ip)
+                        s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+                    except Exception:
+                        pass
+                sockets.append(s)
+            except Exception as e:
+                self._log("WARN", f"Could not bind port {p}: {str(e)}")
+
+        while self.running and sockets:
+            try:
+                r, _, _ = select.select(sockets, [], [], 1.5)
+                for s in r:
+                    data, addr = s.recvfrom(4096)
+                    client_ip = addr[0]
+                    port = s.getsockname()[1]
+                    if client_ip == self.gateway_ip or client_ip.startswith("127."):
+                        continue
+
+                    proto_name = {5353: "mDNS", 5355: "LLMNR", 1900: "SSDP", 3702: "WS-Discovery"}.get(port, f"UDP-{port}")
+                    self.stats["passive_hits"] += 1
+
+                    # Extract ASCII hostname if present in payload
+                    clean_str = re.findall(r"[a-zA-Z0-9-]{3,24}\.(?:local|_tcp|_udp|home|lan)", data.decode("latin1", errors="ignore"))
+                    detected_host = clean_str[0] if clean_str else None
+
+                    if port in (5355, 3702):
+                        cat = "Laptop / Desktop"
+                        name = f"Windows Host ({detected_host})" if detected_host else "Windows PC (LLMNR/WSD)"
+                    elif port == 5353:
+                        cat = "Apple / Laptop"
+                        name = f"Apple/mDNS Host ({detected_host})" if detected_host else "mDNS Host"
+                    else:
+                        cat = "Smart Device / TV"
+                        name = f"UPnP/SSDP Host ({detected_host})" if detected_host else "SSDP Media Host"
+
+                    self.register_device(client_ip, name=name, category=cat, os_ver=f"Passive {proto_name} Broadcast", vector=f"PASSIVE-{proto_name}")
+
+            except Exception:
+                time.sleep(0.5)
+
+        for s in sockets:
+            try:
+                s.close()
+            except Exception:
+                pass
+
+    def _run_active_subnet_prober(self):
+        """Active background prober sweeping delivery optimization, WSD, RPC, and NetBIOS."""
+        self._log("PROBE", f"Active prober initialized. Subnet target: {self.gateway_ip.rsplit('.', 1)[0]}.1-254")
+
+        # Specific ports that laptops maintain open or emit TCP RST on
+        target_ports = [7680, 5357, 135, 445, 8008, 80, 8080, 22, 3389]
+        subnet_prefix = self.gateway_ip.rsplit(".", 1)[0]
+        gw_last = int(self.gateway_ip.rsplit(".", 1)[1])
+
+        while self.running:
+            # Sweep in chunks
+            for i in range(1, 255):
+                if not self.running:
+                    break
+                if i == gw_last:
+                    continue
+
+                ip = f"{subnet_prefix}.{i}"
+
+                # 1. Fast non-blocking TCP probe
+                for port in target_ports:
+                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    s.settimeout(0.04)
+                    try:
+                        res = s.connect_ex((ip, port))
+                        s.close()
+                        if res == 0 or res == 111:  # 0 = OPEN, 111 = ECONNREFUSED (Host is ALIVE!)
+                            self.stats["probe_hits"] += 1
+                            if port in (7680, 5357, 135, 445):
+                                cat, name = "Laptop / Desktop", f"Windows PC (Port {port})"
+                            elif port in (8008, 8009):
+                                cat, name = "Smart TV / Cast", f"Google Cast Device (Port {port})"
+                            elif port == 22:
+                                cat, name = "Linux / Laptop", f"SSH Host (Port 22)"
+                            else:
+                                cat, name = "Connected Device", f"Network Host (Port {port})"
+
+                            self.register_device(ip, name=name, category=cat, os_ver=f"Active TCP Response (Port {port})", vector=f"TCP-{port}")
+                            break
+                    except Exception:
+                        s.close()
+
+                # 2. NetBIOS node status query (UDP 137)
+                try:
+                    nbns_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    nbns_sock.settimeout(0.04)
+                    nbns_query = b"\x80\x01\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x20CKAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\x00\x00\x21\x00\x01"
+                    nbns_sock.sendto(nbns_query, (ip, 137))
+                    data, _ = nbns_sock.recvfrom(1024)
+                    nbns_sock.close()
+                    if data and len(data) > 56:
+                        self.stats["probe_hits"] += 1
+                        # Parse actual Windows Computer Name from NetBIOS payload
+                        comp_name = data[57:72].decode("ascii", errors="ignore").strip()
+                        self.register_device(ip, name=f"Windows PC: {comp_name}", category="Laptop / Desktop", os_ver="NetBIOS Host", vector="NETBIOS-137")
+                except Exception:
+                    pass
+
+            # Pause between subnet sweeps
+            time.sleep(5)
+
+    # =========================================================================
+    # Lifecycle & Telemetry Controls
+    # =========================================================================
+
+    def _start_gateway_server(self):
+        """Fallback HTTP gateway handshake server."""
+        if self.httpd is not None:
+            return
+        try:
+            server_addr = ("0.0.0.0", self.gateway_port)
+            self.httpd = _ThreadedTCPServer(server_addr, _GatewayHTTPHandler)
+            self.httpd.plugin_instance = self
+            self.httpd.gateway_ip = self.gateway_ip
+
+            self.http_thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+            self.http_thread.start()
+        except Exception:
+            pass
+
+    def _stop_gateway_server(self):
+        if self.httpd:
+            try:
+                self.httpd.shutdown()
+                self.httpd.server_close()
+            except Exception:
+                pass
+            self.httpd = None
+            self.http_thread = None
+
+    def on_plugin_load(self):
+        """Registers module routes into Dolphy navigation panels."""
+        try:
+            self.add_module(
+                title="Hotspot Inspector",
+                description="Silent client discovery, device nameplates & terminal",
+                icon="rounded:router",
+                screen="main",
+                section="PLUGINS",
+                order=0
+            )
+        except Exception:
+            pass
+
+        try:
+            self.add_module(
+                title="Hotspot Inspector",
+                description="Silent client discovery, device nameplates & terminal",
+                icon="rounded:router",
+                screen="main",
+                section="WIFI"
+            )
+        except Exception:
+            pass
+
+    def on_load(self):
+        self.on_plugin_load()
+
+    def on_unload(self):
+        """Cleans up all threads and sockets upon exit."""
+        self._log("SYS", "Hotspot Inspector unloading. Terminating background threads...")
+        self.running = False
+        self._stop_gateway_server()
+
+    def toggle_monitor(self, api):
+        """Starts or stops all silent detection engines."""
+        self.api_ref = api
+        if not self.running:
+            self.running = True
+            self.stats["start_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            # 1. Primary Engine: Shizuku & Kernel Poller
+            self.shizuku_thread = threading.Thread(target=self._run_shizuku_poller, daemon=True)
+            self.shizuku_thread.start()
+
+            # 2. Secondary Engine: Passive Multicast Daemon
+            self.multicast_thread = threading.Thread(target=self._run_passive_multicast_listener, daemon=True)
+            self.multicast_thread.start()
+
+            # 3. Secondary Engine: Active Subnet Auto-Prober
+            self.prober_thread = threading.Thread(target=self._run_active_subnet_prober, daemon=True)
+            self.prober_thread.start()
+
+            # 4. Fallback HTTP Gateway
+            self._start_gateway_server()
+
+            self._log("SYS", "ALL SILENT DETECTION ENGINES ACTIVATED.")
+            self._notify(api, "Hotspot Inspector: Silent Engines Active")
+        else:
+            self.running = False
+            self._stop_gateway_server()
+            self._log("SYS", "Monitoring stopped by user.")
+            self._notify(api, "Hotspot Inspector: Stopped")
+
+        self._refresh_ui()
+
+    def _notify(self, api, message):
+        if hasattr(self, "toast"):
+            try:
+                self.toast(message)
+                return
+            except Exception:
+                pass
+        if api and hasattr(api, "toast"):
+            try:
+                api.toast(message)
+                return
+            except Exception:
+                pass
+
+    def _refresh_ui(self):
+        if hasattr(self, "refresh"):
+            try:
+                self.refresh()
+                return
+            except Exception:
+                pass
+        if self.api_ref and hasattr(self.api_ref, "refresh"):
+            try:
+                self.api_ref.refresh()
+            except Exception:
+                pass
+
+    def export_logs(self, api):
+        data = {
+            "session_summary": self.stats,
+            "gateway_ip": self.gateway_ip,
+            "export_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "connected_devices": list(self.connected_devices.values()),
+            "terminal_logs": self.terminal_logs
+        }
+        filename = f"hotspot_inspection_{int(time.time())}.json"
+        try:
+            out_path = os.path.join(os.path.expanduser("~"), filename)
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            self._notify(api, f"Exported: {filename}")
+            self._log("SYS", f"Exported state file: {filename}")
+        except Exception as e:
+            self._notify(api, f"Export error: {str(e)}")
+
+    # =========================================================================
+    # Declarative UI Builders (Material 3 Expressive)
+    # =========================================================================
+
+    def _t(self, ui, text, style="bodyMedium", color=None):
+        style_map = {
+            "titleLarge": "headlineSmall",
+            "titleMedium": "titleMedium",
+            "titleSmall": "titleSmall",
+            "bodyLarge": "bodyLarge",
+            "bodyMedium": "bodyMedium",
+            "bodySmall": "bodySmall",
+            "labelLarge": "labelLarge",
+            "labelMedium": "labelMedium",
+            "labelSmall": "labelSmall",
+        }
+        mapped = style_map.get(style, style)
+        try:
+            if color:
+                return ui.text(text, style=mapped, color=color)
+            return ui.text(text, style=mapped)
+        except Exception:
+            try:
+                return ui.text(text, mapped)
+            except Exception:
+                return ui.text(text)
+
+    def _render_nameplates(self, ui):
+        """Renders stacked top nameplates for every detected device."""
+        cards = []
+
+        cards.append(
+            ui.row([
+                self._t(ui, "CONNECTED DEVICE NAMEPLATES", "titleSmall"),
+                self._t(ui, f"({len(self.connected_devices)} Online)", "labelMedium", color="secondary")
+            ])
+        )
+
+        if not self.connected_devices:
+            cards.append(
+                ui.card([
+                    ui.row([
+                        self._t(ui, "SEARCHING FOR CONNECTED CLIENTS", "titleSmall", color="primary"),
+                        self._t(ui, "SILENT PROBING", "labelSmall", color="tertiary")
+                    ]),
+                    self._t(ui, f"Scanning hotspot subnet {self.gateway_ip.rsplit('.', 1)[0]}.1-254 (Zero-Touch)", "bodySmall"),
+                    self._t(ui, f"Shizuku Status: {self.shizuku_status}", "labelSmall"),
+                    self._t(ui, "As soon as any device connects to Wi-Fi, its Nameplate will automatically appear here.", "bodySmall")
+                ])
+            )
+        else:
+            for ip, dev in self.connected_devices.items():
+                cat_badge = f"[ {dev['category'].upper()} ]"
+                nameplate = ui.card([
+                    ui.row([
+                        self._t(ui, cat_badge, "labelSmall", color="tertiary"),
+                        self._t(ui, "● ONLINE", "labelSmall", color="primary")
+                    ]),
+                    self._t(ui, dev["name"], "titleMedium"),
+                    ui.row([
+                        self._t(ui, f"IP: {dev['ip']}", "bodyMedium"),
+                        self._t(ui, f"ID: {dev['id_code']}", "bodyMedium")
+                    ]),
+                    ui.row([
+                        self._t(ui, f"MAC: {dev['mac']}", "bodySmall"),
+                        self._t(ui, f"Vendor: {dev['vendor']}", "bodySmall")
+                    ]),
+                    ui.row([
+                        self._t(ui, f"Vector: {dev['vector']}", "labelSmall"),
+                        self._t(ui, f"Active: {dev['last_seen']}", "labelSmall")
+                    ])
+                ])
+                cards.append(nameplate)
+
+        return cards
+
+    def _render_terminal(self, ui):
+        """Renders the in-app live terminal log view."""
+        with self._log_lock:
+            logs = list(self.terminal_logs[-16:])
+
+        log_lines = []
+        if not logs:
+            log_lines.append(self._t(ui, "[SYS] Telemetry terminal ready. No events yet.", "bodySmall"))
+        else:
+            for entry in logs:
+                color = "primary" if "[DET]" in entry or "[REG]" in entry else None
+                log_lines.append(self._t(ui, entry, "bodySmall", color=color))
+
+        terminal_card = ui.card([
+            ui.row([
+                self._t(ui, "LIVE SYSTEM TERMINAL", "titleSmall"),
+                ui.button("Clear", on_click=lambda: self.clear_terminal(), style="outlined")
+            ]),
+            ui.card(log_lines),
+            self._t(ui, f"Shizuku Hits: {self.stats['shizuku_hits']} | Passive: {self.stats['passive_hits']} | Active: {self.stats['probe_hits']}", "labelSmall")
+        ])
+        return terminal_card
+
+    def screen_main(self, ui, api, state):
+        """Main Material 3 screen layout."""
+        self.api_ref = api
+
+        # Auto-start all engines on screen view if not already running
+        if not self.running and not self.stats["start_time"]:
+            self.running = True
+            self.stats["start_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            # 1. Primary Shizuku Poller
+            self.shizuku_thread = threading.Thread(target=self._run_shizuku_poller, daemon=True)
+            self.shizuku_thread.start()
+
+            # 2. Secondary Passive Multicast
+            self.multicast_thread = threading.Thread(target=self._run_passive_multicast_listener, daemon=True)
+            self.multicast_thread.start()
+
+            # 3. Secondary Active Subnet Prober
+            self.prober_thread = threading.Thread(target=self._run_active_subnet_prober, daemon=True)
+            self.prober_thread.start()
+
+            # 4. Gateway fallback
+            self._start_gateway_server()
+
+        status_text = "ENGINES ACTIVE" if self.running else "ENGINES STOPPED"
+        btn_label = "Stop All" if self.running else "Start Engines"
+
+        body = []
+
+        # 1. Top Stacked Nameplates
+        body.extend(self._render_nameplates(ui))
+
+        # 2. Control & Engine Status Card
+        status_card = ui.card([
+            ui.row([
+                self._t(ui, f"Status: {status_text}", "titleSmall", color="primary" if self.running else None),
+                self._t(ui, f"Clients: {len(self.connected_devices)}", "titleSmall")
+            ]),
+            self._t(ui, f"Primary Shizuku: {self.shizuku_status}", "bodySmall"),
+            self._t(ui, f"Secondary Engines: Passive Multicast + Subnet Prober (Active)", "bodySmall"),
+            ui.row([
+                ui.button(
+                    btn_label,
+                    on_click=lambda: self.toggle_monitor(api),
+                    style="filled" if not self.running else "tonal"
+                ),
+                ui.button(
+                    "Export JSON",
+                    on_click=lambda: self.export_logs(api),
+                    style="outlined"
+                ),
+                ui.button(
+                    "Refresh",
+                    on_click=lambda: self._refresh_ui(),
+                    style="outlined"
+                )
+            ])
+        ])
+        body.append(status_card)
+
+        # 3. Live System Terminal Card
+        body.append(self._render_terminal(ui))
+
+        try:
+            scrollable = ui.lazy_column(body, padding=16, spacing=12, fill_max_size=True)
+        except Exception:
+            try:
+                scrollable = ui.column(body, padding=16, spacing=12)
+            except Exception:
+                scrollable = ui.column(body)
+
+        try:
+            return ui.scaffold(
+                title="Hotspot Inspector",
+                content=scrollable
+            )
+        except TypeError:
+            return ui.scaffold(
+                title="Hotspot Inspector",
+                body=scrollable
+            )
