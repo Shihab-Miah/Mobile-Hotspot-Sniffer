@@ -146,6 +146,7 @@ class PacketShark(BasePlugin):
         self._last_poll_clients = 0.0
         self._hotspot_clients = set()
         self._client_traffic = {}
+        self._debug_logs = deque(maxlen=250)
 
         # Stats
         self._top_talkers = Counter()
@@ -162,6 +163,7 @@ class PacketShark(BasePlugin):
     # ═══════════ LIFECYCLE ═══════════
 
     def on_plugin_load(self):
+        self._log("info", "PacketShark V1.0.1 initializing...")
         try:
             self.add_module(
                 title="PacketShark",
@@ -171,12 +173,15 @@ class PacketShark(BasePlugin):
                 section="PLUGINS",
                 order=0
             )
+            self._log("info", "Dolphy module registered: PacketShark -> PLUGINS")
         except Exception as exc:
             self._log("error", "add_module failed: " + str(exc))
 
         self._detect_shell()
+        self._log("info", "Shell environment: {} (UID: {})".format(self._shell_mode.upper(), self._uid or "none"))
         self._load_state()
         self._detect_active_hotspot()
+        self._log("info", "Active interface selected: {}".format(self._iface))
         self._poll_system_clients()
         self._ready = True
         self._log("info", "PacketShark ready · Shell: {} · Interface: {}".format(
@@ -291,9 +296,34 @@ class PacketShark(BasePlugin):
             self._hotspot_clients.add(ip)
 
     def _poll_system_clients(self):
-        # 1. Check ARP / ip neigh table
+        self._log("info", "Starting scan for connected hotspot clients...")
+        self._toast("Scanning connected hotspot clients…")
+        found_before = len(self._connected_devices)
+
+        # 1. Active Probing: Send lightweight UDP discovery pings across hotspot subnet (192.168.43.x)
+        # This forces the kernel netfilter to issue ARP requests for each host, prompting the laptop to answer
+        def probe_subnet():
+            try:
+                probe_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                probe_sock.settimeout(0.05)
+                for host in range(2, 35):
+                    for subnet in ("192.168.43", "192.168.44", "192.168.49"):
+                        try:
+                            probe_sock.sendto(b"\x00", ("{}.{}".format(subnet, host), 5353))
+                        except Exception:
+                            pass
+                probe_sock.close()
+                self._log("info", "Subnet probe broadcast complete (woke up ARP cache)")
+            except Exception as e:
+                self._log("warning", "Subnet probe: " + str(e)[:60])
+
+        t = threading.Thread(target=probe_subnet, daemon=True)
+        t.start()
+        t.join(timeout=0.5)
+
+        # 2. Check ARP / ip neigh table
+        raw_neigh = ""
         try:
-            raw_neigh = ""
             if self._shell_mode == "root" and hasattr(self, "root"):
                 raw_neigh = self.root("ip neigh")
             elif self._shell_mode == "shizuku" and hasattr(self, "shizuku"):
@@ -311,10 +341,16 @@ class PacketShark(BasePlugin):
                         raw_neigh = self.root("cat /proc/net/arp")
                     elif self._shell_mode == "shizuku" and hasattr(self, "shizuku"):
                         raw_neigh = self.shizuku("cat /proc/net/arp")
+                    else:
+                        with open("/proc/net/arp", "r") as f:
+                            raw_neigh = f.read()
                 except Exception:
                     pass
 
             text_neigh = self._text(raw_neigh)
+            self._log("info", "Kernel neighbor table raw ({} bytes):\n{}".format(
+                len(text_neigh), text_neigh.strip() or "(empty)"))
+
             for line in text_neigh.splitlines():
                 parts = line.strip().split()
                 # ip neigh: 192.168.43.152 dev ap0 lladdr 38:f9:d3:4a:12:ef REACHABLE
@@ -323,16 +359,35 @@ class PacketShark(BasePlugin):
                     mac = parts[4].lower()
                     if ":" in mac and len(mac) == 17:
                         self._register_or_update_device(ip, mac=mac)
+                        self._log("success", "Discovered client via ip neigh: {} ({})".format(ip, mac))
                 # /proc/net/arp: 192.168.43.152 0x1 0x2 38:f9:d3:4a:12:ef * ap0
                 elif len(parts) >= 4 and ":" in parts[3]:
                     ip = parts[0]
                     mac = parts[3].lower()
                     if len(mac) == 17 and mac != "00:00:00:00:00:00":
                         self._register_or_update_device(ip, mac=mac)
+                        self._log("success", "Discovered client via /proc/net/arp: {} ({})".format(ip, mac))
         except Exception as exc:
-            self._log("warning", "poll neigh: " + str(exc)[:80])
+            self._log("warning", "poll neigh error: " + str(exc)[:80])
 
-        # 2. Check dnsmasq.leases for real hostnames assigned by Android hotspot daemon
+        # 3. Check dumpsys tethering via Shizuku / Root
+        try:
+            raw_teth = ""
+            if self._shell_mode == "shizuku" and hasattr(self, "shizuku"):
+                raw_teth = self.shizuku("dumpsys tethering")
+            elif self._shell_mode == "root" and hasattr(self, "root"):
+                raw_teth = self.root("dumpsys tethering")
+            text_teth = self._text(raw_teth)
+            if text_teth:
+                self._log("info", "dumpsys tethering returned {} bytes".format(len(text_teth)))
+                matches = re.findall(r"([0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5})[^\n\r]*?(192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+)", text_teth)
+                for mac, ip in matches:
+                    self._register_or_update_device(ip, mac=mac.lower())
+                    self._log("success", "Discovered client via dumpsys tethering: {} ({})".format(ip, mac))
+        except Exception as exc:
+            self._log("warning", "dumpsys tethering: " + str(exc)[:80])
+
+        # 4. Check dnsmasq.leases for real hostnames assigned by Android hotspot daemon
         try:
             leases_paths = [
                 "/data/misc/wifi/dnsmasq.leases",
@@ -347,6 +402,7 @@ class PacketShark(BasePlugin):
                     raw_leases = self.shizuku("cat " + lp)
                 text_leases = self._text(raw_leases)
                 if text_leases and "No such file" not in text_leases:
+                    self._log("info", "Found DHCP leases in {}: {}".format(lp, text_leases.strip()))
                     for line in text_leases.splitlines():
                         parts = line.strip().split()
                         # <time> <mac> <ip> <hostname> <client_id>
@@ -357,8 +413,22 @@ class PacketShark(BasePlugin):
                             if hostname == "*":
                                 hostname = ""
                             self._register_or_update_device(ip, mac=mac, name=hostname)
+                            self._log("success", "Discovered DHCP client: {} ({}) hostname={}".format(ip, mac, hostname))
         except Exception as exc:
             self._log("warning", "poll leases: " + str(exc)[:80])
+
+        new_count = len(self._connected_devices)
+        if new_count > found_before:
+            self._toast("Found {} connected client(s)!".format(new_count))
+            self._log("success", "Scan complete: {} total clients registered".format(new_count))
+        elif new_count > 0:
+            self._toast("Refreshed: {} device(s) connected".format(new_count))
+            self._log("info", "Scan complete: {} active clients in registry".format(new_count))
+        else:
+            self._toast("0 devices in ARP cache. Tap 'Start Live Stream' to sniff wire packets!")
+            self._log("warning", "Scan complete: 0 devices in ARP cache. Shell mode: {}".format(self._shell_mode.upper()))
+
+        self._refresh(force=True)
 
     def _parse_dhcp(self, payload):
         if len(payload) < 240:
@@ -501,6 +571,32 @@ class PacketShark(BasePlugin):
 
         return items
 
+    def _diagnostic_terminal_ui(self, ui):
+        with self._lock:
+            logs = list(self._debug_logs)
+
+        preview_text = "\n".join(logs[-40:]) if logs else "[Diagnostic Terminal Initialized]\nWaiting for events…"
+
+        mode_str = "🟢 ROOT" if self._shell_mode == "root" else "🟡 SHIZUKU" if self._shell_mode == "shizuku" else "⚪ NO ROOT/SHIZUKU"
+
+        return ui.card([
+            ui.row([
+                ui.text("📟  DIAGNOSTIC TERMINAL (LIVE LOGS)", "titleSmall", color="primary"),
+                ui.text("{} events".format(len(logs)), "labelSmall", color="secondary"),
+            ]),
+            ui.row([
+                ui.text("Shell Status: " + mode_str, "labelSmall", color="muted"),
+                ui.text("Interface: " + self._iface.upper(), "labelSmall", color="secondary"),
+            ]),
+            ui.log_panel(preview_text, max_height=200),
+            ui.row([
+                self._button(ui, "📋 Copy Diagnostics", self._copy_debug_logs, style="tonal"),
+                self._button(ui, "🔄 Rescan Clients", self._poll_system_clients, style="filled"),
+                self._button(ui, "🗑 Clear", self._clear_debug_logs, style="outlined"),
+            ]),
+            ui.text("💡 Real-time event log: shows ARP scans, probes, and errors. Tap 'Copy Diagnostics' to share with dev.", "labelSmall", color="muted"),
+        ])
+
     def _detect_shell(self):
         try:
             uid = self._try_shell_uid("root")
@@ -590,12 +686,68 @@ class PacketShark(BasePlugin):
         except Exception:
             pass
 
+    @staticmethod
+    def _text(value):
+        if value is None:
+            return ""
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="replace")
+        if isinstance(value, (list, tuple)):
+            return "\n".join(PacketShark._text(x) for x in value)
+        if isinstance(value, dict):
+            for key in ("out", "stdout", "output", "text"):
+                if key in value and value[key] is not None:
+                    return PacketShark._text(value[key])
+            return json.dumps(value)
+        return str(value)
+
     def _log(self, level, message):
+        ts = time.strftime("%H:%M:%S", time.localtime()) + ".{:03d}".format(int((time.time() % 1) * 1000))
+        entry = "[{}] [{}] {}".format(ts, level.upper()[:4], str(message))
+        if hasattr(self, "_debug_logs"):
+            with self._lock:
+                self._debug_logs.append(entry)
         try:
             if hasattr(self, "log"):
                 self.log(level, str(message))
         except Exception:
             pass
+
+    def _copy_debug_logs(self):
+        with self._lock:
+            out = "\n".join(self._debug_logs)
+        if not out:
+            self._toast("Diagnostics log is empty")
+            return
+
+        try:
+            with open("/sdcard/Download/packetshark_diagnostics.txt", "w") as f:
+                f.write(out)
+        except Exception:
+            pass
+
+        copied = False
+        try:
+            if hasattr(self, "api") and hasattr(self.api, "clipboard"):
+                self.api.clipboard.set(out)
+                copied = True
+            elif hasattr(self, "set_clipboard"):
+                self.set_clipboard(out)
+                copied = True
+        except Exception:
+            pass
+
+        if copied:
+            self._toast("📋 Copied to clipboard & saved to Download/packetshark_diagnostics.txt")
+        else:
+            self._toast("📋 Saved to /sdcard/Download/packetshark_diagnostics.txt")
+
+    def _clear_debug_logs(self):
+        with self._lock:
+            self._debug_logs.clear()
+        self._log("info", "Diagnostic terminal cleared")
+        self._toast("Diagnostics cleared")
+        self._refresh(force=True)
 
     def _toast(self, message):
         try:
@@ -1251,11 +1403,107 @@ class PacketShark(BasePlugin):
             except Exception as exc:
                 self._log("warning", "Raw socket: " + str(exc)[:100])
 
-            # Strategy 3: Shizuku / Shell Socket Poll
-            self._log("info", "Monitoring network activity via shell state")
-            while not self._stop.is_set():
-                time.sleep(0.5)
+            # Strategy 3: Non-Root Multicast & Broadcast Sniffer (mDNS 5353 & SSDP 1900)
+            self._log("info", "Starting non-root LAN sniffer (mDNS 5353 & SSDP 1900 multicast listener)")
+            socks = []
+            try:
+                mdns_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+                mdns_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                mdns_sock.bind(("", 5353))
+                mreq = struct.pack("4sl", socket.inet_aton("224.0.0.251"), socket.INADDR_ANY)
+                mdns_sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+                mdns_sock.settimeout(0.4)
+                socks.append(("mDNS", mdns_sock))
+                self._log("info", "Bound mDNS socket on 224.0.0.251:5353")
+            except Exception as e:
+                self._log("warning", "mDNS socket: " + str(e)[:60])
 
+            try:
+                ssdp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+                ssdp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                ssdp_sock.bind(("", 1900))
+                mreq2 = struct.pack("4sl", socket.inet_aton("239.255.255.250"), socket.INADDR_ANY)
+                ssdp_sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq2)
+                ssdp_sock.settimeout(0.4)
+                socks.append(("SSDP", ssdp_sock))
+                self._log("info", "Bound SSDP socket on 239.255.255.250:1900")
+            except Exception as e:
+                self._log("warning", "SSDP socket: " + str(e)[:60])
+
+            last_poll = 0.0
+            while not self._stop.is_set():
+                now = time.time()
+                if now - last_poll > 3.0:
+                    last_poll = now
+                    try:
+                        self._poll_system_clients()
+                    except Exception:
+                        pass
+
+                for proto_label, s in socks:
+                    try:
+                        data, addr = s.recvfrom(2048)
+                        if data and addr:
+                            client_ip = addr[0]
+                            if client_ip in ("127.0.0.1", "0.0.0.0"):
+                                continue
+
+                            ts = time.time()
+                            pkt = {
+                                "time": ts,
+                                "len": len(data),
+                                "raw": data,
+                                "eth": {"src": "LAN-Client", "dst": "Broadcast", "type": "0x0800"},
+                                "ip": {"version": 4, "src": client_ip, "dst": "224.0.0.251", "proto": proto_label},
+                                "arp": None,
+                                "l4": {"type": "UDP", "sport": addr[1], "dport": 5353 if proto_label == "mDNS" else 1900},
+                                "app": None,
+                                "proto": proto_label,
+                                "src": client_ip,
+                                "dst": "Multicast",
+                                "info": "",
+                                "is_hotspot": True,
+                            }
+
+                            if proto_label == "mDNS":
+                                mdns_name = self._parse_mdns_name(data)
+                                pkt["info"] = "mDNS: {}".format(mdns_name or "Query/Announcement")
+                                if mdns_name:
+                                    self._register_or_update_device(client_ip, name=mdns_name)
+                                else:
+                                    self._register_or_update_device(client_ip)
+                            elif proto_label == "SSDP":
+                                text_data = data.decode("utf-8", errors="replace")
+                                first_line = text_data.splitlines()[0] if text_data.splitlines() else "UPnP M-SEARCH"
+                                pkt["info"] = first_line[:40]
+                                self._register_or_update_device(client_ip, vendor_class="UPnP/SSDP")
+
+                            with self._lock:
+                                self._packets.append(pkt)
+                                self._pkt_counter += 1
+                                self._bytes_total += len(data)
+                                self._top_talkers[client_ip] += len(data)
+                                self._proto_counts[proto_label] += 1
+                                if client_ip in self._connected_devices:
+                                    self._connected_devices[client_ip]["pkts"] += 1
+                                    self._connected_devices[client_ip]["bytes"] += len(data)
+                                    self._connected_devices[client_ip]["last_seen"] = ts
+
+                            if self._pkt_counter <= 10 or self._pkt_counter % 15 == 0:
+                                self._log("success", "Received {} frame from {}: {}".format(
+                                    proto_label, client_ip, pkt["info"]))
+
+                            self._refresh()
+                    except socket.timeout:
+                        continue
+                    except Exception:
+                        pass
+
+            for _, s in socks:
+                try:
+                    s.close()
+                except Exception:
+                    pass
             self._log("info", "Capture stopped")
 
         self._thread = threading.Thread(target=capture_worker, daemon=True)
@@ -1844,6 +2092,8 @@ class PacketShark(BasePlugin):
         body = []
         # Top-Stacked Connected Device Nameplates
         body.extend(self._render_nameplates(ui))
+        # Live Internal Diagnostic Terminal (Shows everything happening from the start)
+        body.append(self._diagnostic_terminal_ui(ui))
         # Current Tab Body Content
         body.extend(page_body)
 
