@@ -1,0 +1,723 @@
+# -*- coding: utf-8 -*-
+"""
+Dolphy App Plugin: Hotspot Network Inspector & Device Identifier
+Compatible with Dolphy 2.5+ (Chaquopy Python 3.11 Runtime)
+"""
+
+__id__ = "hotspot_inspector"
+__name__ = "Hotspot Inspector"
+__title__ = "Hotspot Inspector"
+__icon__ = "rounded:router"
+__version__ = "1.1.0"
+__author__ = "Lab"
+__description__ = "Live hotspot client discovery, device nameplates, and real-time terminal telemetry."
+__permissions__ = ["files", "shizuku"]
+
+import os
+import re
+import sys
+import time
+import json
+import socket
+import select
+import hashlib
+import threading
+import http.server
+import socketserver
+from datetime import datetime
+
+# Dolphy BasePlugin injection fallback
+if "BasePlugin" not in globals() and "BasePlugin" not in dir(__builtins__):
+    try:
+        from dolphy import BasePlugin
+    except Exception:
+        try:
+            from dolphy.plugin import BasePlugin
+        except Exception:
+            class BasePlugin:
+                def __init__(self, *args, **kwargs):
+                    self.modules = []
+                def add_module(self, *args, **kwargs):
+                    pass
+                def toast(self, msg): pass
+                def log(self, level, msg): pass
+                def refresh(self): pass
+                def root(self, cmd): return ""
+                def shizuku(self, cmd): return ""
+
+
+class _GatewayHTTPHandler(http.server.BaseHTTPRequestHandler):
+    """Handles incoming HTTP handshakes from connected devices to fingerprint OS and identity."""
+
+    def log_message(self, format, *args):
+        # Suppress stdout clutter, route to plugin logger
+        pass
+
+    def do_GET(self):
+        client_ip = self.client_address[0]
+        user_agent = self.headers.get("User-Agent", "Unknown Device")
+        host_header = self.headers.get("Host", "")
+
+        # Route client info to parent plugin instance
+        if hasattr(self.server, "plugin_instance"):
+            self.server.plugin_instance.register_client_handshake(client_ip, user_agent, host_header)
+
+        # Send captive portal registration confirmation
+        body = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Hotspot Inspector - Registered</title>
+    <style>
+        body {{
+            background: #0f141c;
+            color: #e2e8f0;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            margin: 0;
+            padding: 30px 16px;
+            display: flex;
+            justify-content: center;
+        }}
+        .box {{
+            background: #1a2230;
+            border: 1px solid #2d3748;
+            border-radius: 16px;
+            padding: 24px;
+            max-width: 440px;
+            width: 100%;
+            box-shadow: 0 10px 25px rgba(0,0,0,0.5);
+            text-align: center;
+        }}
+        .badge {{
+            display: inline-block;
+            background: #10b981;
+            color: #ffffff;
+            padding: 6px 14px;
+            border-radius: 9999px;
+            font-size: 13px;
+            font-weight: 700;
+            letter-spacing: 0.5px;
+            margin-bottom: 16px;
+        }}
+        h2 {{ margin: 0 0 10px; font-size: 22px; color: #ffffff; }}
+        p {{ margin: 6px 0; color: #94a3b8; font-size: 14px; line-height: 1.5; }}
+        .data-grid {{
+            margin-top: 20px;
+            text-align: left;
+            background: #111827;
+            padding: 14px;
+            border-radius: 10px;
+            border: 1px solid #1f2937;
+        }}
+        .data-row {{
+            display: flex;
+            justify-content: space-between;
+            margin: 6px 0;
+            font-size: 13px;
+        }}
+        .label {{ color: #64748b; font-weight: 600; }}
+        .value {{ color: #38bdf8; font-family: monospace; font-weight: bold; }}
+    </style>
+</head>
+<body>
+    <div class="box">
+        <span class="badge">&#10003; CONNECTED &amp; REGISTERED</span>
+        <h2>Hotspot Inspector</h2>
+        <p>Your device handshake has been successfully logged by the Android Hotspot Inspector.</p>
+        <div class="data-grid">
+            <div class="data-row">
+                <span class="label">Your IP:</span>
+                <span class="value">{client_ip}</span>
+            </div>
+            <div class="data-row">
+                <span class="label">Gateway:</span>
+                <span class="value">{self.server.gateway_ip}:8080</span>
+            </div>
+            <div class="data-row">
+                <span class="label">Timestamp:</span>
+                <span class="value">{datetime.now().strftime("%H:%M:%S")}</span>
+            </div>
+        </div>
+    </div>
+</body>
+</html>"""
+        encoded = body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(encoded)
+
+
+class _ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+class HotspotInspector(BasePlugin):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.running = False
+        self.monitor_thread = None
+        self.httpd = None
+        self.http_thread = None
+        self.api_ref = None
+
+        self.gateway_ip = self._detect_gateway_ip()
+        self.gateway_port = 8080
+
+        # Connected clients dict: key = IP
+        # Value = { 'ip', 'name', 'id_code', 'category', 'os', 'agent', 'mac', 'first_seen', 'last_seen', 'requests' }
+        self.connected_devices = {}
+        self.traffic_events = []
+        self.terminal_logs = []
+        self._log_lock = threading.Lock()
+
+        self.stats = {
+            "total_clients": 0,
+            "total_flows": 0,
+            "start_time": None
+        }
+
+        self._log("SYS", f"Hotspot Inspector V1.1.0 engine ready. Gateway IP: {self.gateway_ip}")
+
+    # =========================================================================
+    # Terminal Logging Subsystem
+    # =========================================================================
+
+    def _log(self, tag, message):
+        """Appends formatted timestamped lines to the in-app terminal log buffer."""
+        ts = datetime.now().strftime("%H:%M:%S")
+        entry = f"[{ts}] [{tag}] {message}"
+        with self._log_lock:
+            self.terminal_logs.append(entry)
+            if len(self.terminal_logs) > 150:
+                self.terminal_logs.pop(0)
+
+        # Forward to Dolphy console if available
+        if hasattr(self, "log"):
+            try:
+                self.log("info", entry)
+            except Exception:
+                pass
+
+    def clear_terminal(self):
+        with self._log_lock:
+            self.terminal_logs = [f"[{datetime.now().strftime('%H:%M:%S')}] [SYS] Terminal console cleared."]
+        self._refresh_ui()
+
+    # =========================================================================
+    # Network Gateway & Device Fingerprinting
+    # =========================================================================
+
+    def _detect_gateway_ip(self):
+        """Dynamically identifies the phone's hotspot IP address on ap0 or local route."""
+        # 1. Inspect libc getifaddrs via ctypes
+        try:
+            import ctypes
+            import ctypes.util
+
+            libc_name = ctypes.util.find_library("c") or "libc.so"
+            libc = ctypes.CDLL(libc_name)
+
+            class SockAddr(ctypes.Structure):
+                _fields_ = [("sa_family", ctypes.c_ushort), ("sa_data", ctypes.c_char * 14)]
+
+            class SockAddrIn(ctypes.Structure):
+                _fields_ = [
+                    ("sin_family", ctypes.c_ushort),
+                    ("sin_port", ctypes.c_ushort),
+                    ("sin_addr", ctypes.c_uint32),
+                    ("sin_zero", ctypes.c_char * 8),
+                ]
+
+            class IfAddrs(ctypes.Structure):
+                pass
+
+            IfAddrs._fields_ = [
+                ("ifa_next", ctypes.POINTER(IfAddrs)),
+                ("ifa_name", ctypes.c_char_p),
+                ("ifa_flags", ctypes.c_uint),
+                ("ifa_addr", ctypes.POINTER(SockAddr)),
+                ("ifa_netmask", ctypes.POINTER(SockAddr)),
+                ("ifa_ifu", ctypes.c_void_p),
+                ("ifa_data", ctypes.c_void_p),
+            ]
+
+            getifaddrs = libc.getifaddrs
+            getifaddrs.argtypes = [ctypes.POINTER(ctypes.POINTER(IfAddrs))]
+            getifaddrs.restype = ctypes.c_int
+            freeifaddrs = libc.freeifaddrs
+            freeifaddrs.argtypes = [ctypes.POINTER(IfAddrs)]
+
+            ifap = ctypes.POINTER(IfAddrs)()
+            if getifaddrs(ctypes.byref(ifap)) == 0 and ifap:
+                curr = ifap
+                detected_ap = None
+                while curr:
+                    item = curr.contents
+                    if item.ifa_name and item.ifa_addr:
+                        name = item.ifa_name.decode("utf-8", errors="ignore")
+                        family = item.ifa_addr.contents.sa_family
+                        if family == socket.AF_INET:
+                            sin = ctypes.cast(item.ifa_addr, ctypes.POINTER(SockAddrIn)).contents
+                            ip_bytes = sin.sin_addr.to_bytes(4, byteorder=sys.byteorder)
+                            ip_str = socket.inet_ntoa(ip_bytes)
+                            if name.startswith("ap") or name.startswith("swlan") or name.startswith("softap"):
+                                detected_ap = ip_str
+                                break
+                    curr = item.ifa_next
+                freeifaddrs(ifap)
+                if detected_ap:
+                    return detected_ap
+        except Exception:
+            pass
+
+        # 2. Fallback to outbound socket query
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 53))
+            ip = s.getsockname()[0]
+            s.close()
+            if ip and not ip.startswith("127."):
+                return ip
+        except Exception:
+            pass
+
+        return "10.187.128.153"
+
+    def _fingerprint_client(self, user_agent):
+        """Analyzes User-Agent to classify device category and operating system."""
+        ua = user_agent.lower()
+
+        # Category: Laptop / Desktop
+        if "windows" in ua:
+            os_ver = "Windows 11 / 10"
+            if "nt 10.0" in ua:
+                os_ver = "Windows 11 / 10"
+            elif "nt 6.3" in ua:
+                os_ver = "Windows 8.1"
+            elif "nt 6.1" in ua:
+                os_ver = "Windows 7"
+            return "Windows Workstation", "Laptop / Desktop", os_ver
+
+        if "macintosh" in ua or "mac os x" in ua:
+            return "Apple Mac", "Laptop / MacBook", "macOS"
+
+        if "cros" in ua:
+            return "Chromebook", "Laptop / Chromebook", "ChromeOS"
+
+        if "linux" in ua and "android" not in ua:
+            return "Linux Machine", "Laptop / Desktop", "Linux OS"
+
+        # Category: Tablets
+        if "ipad" in ua:
+            return "Apple iPad", "Tablet", "iPadOS"
+
+        if "tablet" in ua or ("android" in ua and "mobile" not in ua):
+            return "Android Tablet", "Tablet", "Android"
+
+        # Category: Mobile Phones
+        if "iphone" in ua:
+            return "Apple iPhone", "Mobile Phone", "iOS"
+
+        if "android" in ua:
+            return "Android Phone", "Mobile Phone", "Android"
+
+        # Category: Smart TV & Appliances
+        if any(tv in ua for tv in ["smart-tv", "smarttv", "tizen", "webos", "roku", "appletv", "hbbtv", "googletv"]):
+            return "Smart TV", "Smart TV / Streaming", "Smart TV OS"
+
+        if "curl" in ua or "wget" in ua or "python" in ua:
+            return "Command Terminal", "Terminal / CLI", "Shell Script"
+
+        return "Connected Host", "Network Device", "Standard Client"
+
+    def register_client_handshake(self, ip, user_agent, host_header):
+        """Processes an incoming HTTP gateway handshake and creates/updates a Nameplate."""
+        name, category, os_ver = self._fingerprint_client(user_agent)
+        
+        # Generate short persistent ID code from IP and Agent
+        code_hash = hashlib.sha256(f"{ip}:{user_agent}".encode("utf-8")).hexdigest()[:6].upper()
+        id_code = f"DEV-{code_hash}"
+
+        ts = datetime.now().strftime("%H:%M:%S")
+
+        is_new = ip not in self.connected_devices
+        if is_new:
+            self.connected_devices[ip] = {
+                "ip": ip,
+                "name": name,
+                "id_code": id_code,
+                "category": category,
+                "os": os_ver,
+                "agent": user_agent,
+                "first_seen": ts,
+                "last_seen": ts,
+                "requests": 1
+            }
+            self._log("DET", f"NEW DEVICE DETECTED: {ip} -> {name} [{category}]")
+            self._log("REG", f"Nameplate registered: Code={id_code} | OS={os_ver}")
+        else:
+            dev = self.connected_devices[ip]
+            dev["last_seen"] = ts
+            dev["requests"] += 1
+            dev["name"] = name
+            dev["category"] = category
+            dev["os"] = os_ver
+            self._log("ACT", f"Client {ip} ({id_code}) active at {ts} (Hit #{dev['requests']})")
+
+        self.stats["total_clients"] = len(self.connected_devices)
+        self.stats["total_flows"] += 1
+
+        # Trigger reactive UI refresh in Dolphy
+        self._refresh_ui()
+
+    # =========================================================================
+    # Lifecycle & Telemetry Engine
+    # =========================================================================
+
+    def on_plugin_load(self):
+        """Registers the module into Dolphy navigation panels."""
+        self._log("SYS", "Registering Hotspot Inspector module routes...")
+        try:
+            self.add_module(
+                title="Hotspot Inspector",
+                description="Live client discovery, device nameplates & terminal",
+                icon="rounded:router",
+                screen="main",
+                section="PLUGINS",
+                order=0
+            )
+        except Exception:
+            pass
+
+        try:
+            self.add_module(
+                title="Hotspot Inspector",
+                description="Live client discovery, device nameplates & terminal",
+                icon="rounded:router",
+                screen="main",
+                section="WIFI"
+            )
+        except Exception:
+            pass
+
+    def on_load(self):
+        self.on_plugin_load()
+
+    def on_unload(self):
+        """Cleanup sockets and threads upon plugin unload."""
+        self._log("SYS", "Plugin unloading, cleaning up server threads...")
+        self.running = False
+        self._stop_gateway_server()
+
+    def _start_gateway_server(self):
+        """Launches the gateway HTTP server in a daemon thread."""
+        if self.httpd is not None:
+            return
+
+        try:
+            server_addr = ("0.0.0.0", self.gateway_port)
+            self.httpd = _ThreadedTCPServer(server_addr, _GatewayHTTPHandler)
+            self.httpd.plugin_instance = self
+            self.httpd.gateway_ip = self.gateway_ip
+
+            self.http_thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+            self.http_thread.start()
+            self._log("SRV", f"Gateway listener active on http://{self.gateway_ip}:{self.gateway_port}")
+            self._log("INFO", f"Visit http://{self.gateway_ip}:{self.gateway_port} on any device to register it!")
+        except Exception as e:
+            self._log("ERR", f"Failed starting gateway server: {str(e)}")
+
+    def _stop_gateway_server(self):
+        if self.httpd:
+            try:
+                self.httpd.shutdown()
+                self.httpd.server_close()
+            except Exception:
+                pass
+            self.httpd = None
+            self.http_thread = None
+            self._log("SRV", "Gateway listener terminated.")
+
+    def _probe_shizuku_and_proc(self):
+        """Attempts privileged Shizuku or kernel ARP reads if available."""
+        # 1. Shizuku check
+        if hasattr(self, "shizuku"):
+            try:
+                out = self.shizuku("ip neigh show")
+                if out and "dev" in out:
+                    for line in out.splitlines():
+                        parts = line.strip().split()
+                        if len(parts) >= 5:
+                            ip = parts[0]
+                            mac = parts[4]
+                            if ip != self.gateway_ip and re.match(r"^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$", mac):
+                                if ip not in self.connected_devices:
+                                    self.register_client_handshake(ip, f"Shizuku-Discovered-Device ({mac})", "")
+            except Exception:
+                pass
+
+        # 2. Kernel proc read attempt
+        arp_path = "/proc/net/arp"
+        if os.path.exists(arp_path):
+            try:
+                with open(arp_path, "r", encoding="utf-8") as f:
+                    for line in f.readlines()[1:]:
+                        parts = line.strip().split()
+                        if len(parts) >= 6 and parts[2] != "0x0" and parts[3] != "00:00:00:00:00:00":
+                            ip, mac = parts[0], parts[3]
+                            if ip not in self.connected_devices:
+                                self.register_client_handshake(ip, f"ARP-Discovered-Device ({mac})", "")
+            except Exception:
+                pass
+
+    def _monitor_loop(self):
+        """Background telemetry loop updating telemetry and probing network."""
+        while self.running:
+            self._probe_shizuku_and_proc()
+            time.sleep(3)
+
+    def toggle_monitor(self, api):
+        """Starts or stops real-time monitoring and gateway discovery."""
+        self.api_ref = api
+        if not self.running:
+            self.running = True
+            self.stats["start_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self._start_gateway_server()
+
+            self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
+            self.monitor_thread.start()
+            self._notify(api, "Hotspot Inspector: Active & Listening")
+        else:
+            self.running = False
+            self._stop_gateway_server()
+            self._notify(api, "Hotspot Inspector: Stopped")
+
+        self._refresh_ui()
+
+    def _notify(self, api, message):
+        if hasattr(self, "toast"):
+            try:
+                self.toast(message)
+                return
+            except Exception:
+                pass
+        if api and hasattr(api, "toast"):
+            try:
+                api.toast(message)
+                return
+            except Exception:
+                pass
+
+    def _refresh_ui(self):
+        if hasattr(self, "refresh"):
+            try:
+                self.refresh()
+                return
+            except Exception:
+                pass
+        if self.api_ref and hasattr(self.api_ref, "refresh"):
+            try:
+                self.api_ref.refresh()
+            except Exception:
+                pass
+
+    def export_logs(self, api):
+        """Exports session state, nameplates, and terminal log history to JSON."""
+        data = {
+            "session_summary": self.stats,
+            "gateway_ip": self.gateway_ip,
+            "export_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "connected_devices": list(self.connected_devices.values()),
+            "terminal_logs": self.terminal_logs
+        }
+        filename = f"hotspot_inspection_{int(time.time())}.json"
+        try:
+            out_path = os.path.join(os.path.expanduser("~"), filename)
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            self._notify(api, f"Exported: {filename}")
+            self._log("SYS", f"Exported state file: {filename}")
+        except Exception as e:
+            self._notify(api, f"Export error: {str(e)}")
+
+    # =========================================================================
+    # Declarative UI Builders (Material 3 Expressive)
+    # =========================================================================
+
+    def _t(self, ui, text, style="bodyMedium", color=None):
+        """Robust text component helper compatible with various Dolphy M3 engines."""
+        style_map = {
+            "titleLarge": "headlineSmall",
+            "titleMedium": "titleMedium",
+            "titleSmall": "titleSmall",
+            "bodyLarge": "bodyLarge",
+            "bodyMedium": "bodyMedium",
+            "bodySmall": "bodySmall",
+            "labelLarge": "labelLarge",
+            "labelMedium": "labelMedium",
+            "labelSmall": "labelSmall",
+        }
+        mapped = style_map.get(style, style)
+        try:
+            if color:
+                return ui.text(text, style=mapped, color=color)
+            return ui.text(text, style=mapped)
+        except Exception:
+            try:
+                return ui.text(text, mapped)
+            except Exception:
+                return ui.text(text)
+
+    def _render_nameplates(self, ui):
+        """Renders stacked top nameplates for every detected device."""
+        cards = []
+
+        # Section Header
+        cards.append(
+            ui.row([
+                self._t(ui, "CONNECTED DEVICE NAMEPLATES", "titleSmall"),
+                self._t(ui, f"({len(self.connected_devices)} Online)", "labelMedium", color="secondary")
+            ])
+        )
+
+        if not self.connected_devices:
+            # Placeholder card with clear instructions
+            cards.append(
+                ui.card([
+                    ui.row([
+                        self._t(ui, "AWAITING DEVICE HANDSHAKES", "titleSmall", color="primary"),
+                        self._t(ui, "LISTENING", "labelSmall", color="tertiary")
+                    ]),
+                    self._t(ui, "Open this link on your connected Laptop, Tablet, or TV browser:", "bodySmall"),
+                    ui.card([
+                        ui.row([
+                            self._t(ui, f"http://{self.gateway_ip}:{self.gateway_port}", "titleMedium", color="primary")
+                        ])
+                    ]),
+                    self._t(ui, "The instant a device connects, its Name, IP, Category, and OS will be pinned here as a Nameplate.", "bodySmall")
+                ])
+            )
+        else:
+            # Stacked Nameplates for every device
+            for ip, dev in self.connected_devices.items():
+                cat_badge = f"[ {dev['category'].upper()} ]"
+                nameplate = ui.card([
+                    # Row 1: Category Badge & Status Indicator
+                    ui.row([
+                        self._t(ui, cat_badge, "labelSmall", color="tertiary"),
+                        self._t(ui, "● ONLINE", "labelSmall", color="primary")
+                    ]),
+                    # Row 2: Device Name headline
+                    self._t(ui, dev["name"], "titleMedium"),
+                    # Row 3: Grid of ID, IP, and details
+                    ui.row([
+                        self._t(ui, f"IP: {dev['ip']}", "bodyMedium"),
+                        self._t(ui, f"ID: {dev['id_code']}", "bodyMedium")
+                    ]),
+                    ui.row([
+                        self._t(ui, f"Platform: {dev['os']}", "bodySmall"),
+                        self._t(ui, f"Active: {dev['last_seen']}", "bodySmall")
+                    ]),
+                    self._t(ui, f"Client Details: {dev['agent'][:55]}...", "bodySmall")
+                ])
+                cards.append(nameplate)
+
+        return cards
+
+    def _render_terminal(self, ui):
+        """Renders the in-app live terminal log view."""
+        with self._log_lock:
+            logs = list(self.terminal_logs[-16:])
+
+        log_lines = []
+        if not logs:
+            log_lines.append(self._t(ui, "[SYS] Telemetry terminal ready. No events yet.", "bodySmall"))
+        else:
+            for entry in logs:
+                color = "primary" if "[DET]" in entry or "[REG]" in entry else None
+                log_lines.append(self._t(ui, entry, "bodySmall", color=color))
+
+        terminal_card = ui.card([
+            ui.row([
+                self._t(ui, "LIVE SYSTEM TERMINAL", "titleSmall"),
+                ui.button("Clear", on_click=lambda: self.clear_terminal(), style="outlined")
+            ]),
+            ui.card(log_lines),
+            self._t(ui, "Real-time socket, gateway, and discovery logs from startup.", "labelSmall")
+        ])
+        return terminal_card
+
+    def screen_main(self, ui, api, state):
+        """Main Material 3 screen layout."""
+        self.api_ref = api
+
+        # Auto-start gateway listener on first screen view if not already running
+        if not self.running and not self.stats["start_time"]:
+            self.running = True
+            self.stats["start_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self._start_gateway_server()
+            self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
+            self.monitor_thread.start()
+
+        status_text = "MONITORING ACTIVE" if self.running else "MONITOR STOPPED"
+        btn_label = "Stop Telemetry" if self.running else "Start Telemetry"
+
+        body = []
+
+        # 1. Top Stacked Nameplates
+        body.extend(self._render_nameplates(ui))
+
+        # 2. Control & Telemetry Status Card
+        status_card = ui.card([
+            ui.row([
+                self._t(ui, f"Status: {status_text}", "titleSmall", color="primary" if self.running else None),
+                self._t(ui, f"Clients: {len(self.connected_devices)}", "titleSmall")
+            ]),
+            self._t(ui, f"Hotspot Gateway: {self.gateway_ip}:{self.gateway_port}", "bodySmall"),
+            ui.row([
+                ui.button(
+                    btn_label,
+                    on_click=lambda: self.toggle_monitor(api),
+                    style="filled" if not self.running else "tonal"
+                ),
+                ui.button(
+                    "Export JSON",
+                    on_click=lambda: self.export_logs(api),
+                    style="outlined"
+                ),
+                ui.button(
+                    "Refresh",
+                    on_click=lambda: self._refresh_ui(),
+                    style="outlined"
+                )
+            ])
+        ])
+        body.append(status_card)
+
+        # 3. Live System Terminal Card
+        body.append(self._render_terminal(ui))
+
+        # Build lazy column
+        try:
+            scrollable = ui.lazy_column(body, padding=16, spacing=12, fill_max_size=True)
+        except Exception:
+            try:
+                scrollable = ui.column(body, padding=16, spacing=12)
+            except Exception:
+                scrollable = ui.column(body)
+
+        try:
+            return ui.scaffold(
+                title="Hotspot Inspector",
+                content=scrollable
+            )
+        except TypeError:
+            return ui.scaffold(
+                title="Hotspot Inspector",
+                body=scrollable
+            )
